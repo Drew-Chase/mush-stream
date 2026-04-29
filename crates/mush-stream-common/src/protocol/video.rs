@@ -1,21 +1,38 @@
 //! Video transport: framing a NAL byte slice into UDP datagrams and
 //! reassembling them on the receive side.
 //!
-//! Wire format per project spec (little-endian, 20-byte header):
+//! Wire format (little-endian, 20-byte header):
 //! ```text
-//!   offset  0  4  6  8  9 12         20
-//!           |  |  |  |  |  |          |
-//!           +--+--+--+--+--+----------+--- payload (≤ 1200 bytes) ---
-//!           |fid|pi|pc|fl| pad |  ts_us |
+//!   offset  0  4  6  8  9 10  12         20
+//!           |  |  |  |  |  |   |          |
+//!           +--+--+--+--+--+---+----------+--- payload (≤ 1200 bytes) ---
+//!           |fid|pi|pc|fl|pc'| ld|  ts_us  |
 //! ```
-//! `fid` = frame_id (u32), `pi` = packet_index (u16), `pc` = packet_count (u16),
-//! `fl` = flags (u8: bit0 keyframe, bit1 last_in_frame), `pad` = 3 zero bytes,
-//! `ts_us` = host capture timestamp in microseconds (u64).
+//! - `fid` = frame_id (u32)
+//! - `pi`  = packet_index (u16). For data packets in `[0, packet_count)`;
+//!   for parity packets in `[0, parity_count)`.
+//! - `pc`  = packet_count (u16): number of *data* packets.
+//! - `fl`  = flags (u8): bit0 keyframe, bit1 last_in_data_frame, bit2 is_parity.
+//! - `pc'` = parity_count (u8): number of parity packets after the data
+//!   packets on the wire; 0 means no FEC.
+//! - `ld`  = last_data_size (u16): actual byte size of the final data
+//!   packet's payload (≤ `MAX_PAYLOAD`); needed when FEC is active
+//!   because every shard must be `MAX_PAYLOAD` bytes for reed-solomon, so
+//!   the last data packet is zero-padded on the wire and its real length
+//!   lives here.
+//! - `ts_us` = host capture timestamp in microseconds (u64).
+//!
+//! When FEC is inactive, both `pc'` and `ld` are zero — making the M3
+//! header layout (3-byte pad) byte-equivalent to today's. So existing
+//! senders/receivers interoperate with the M7 layout as long as they
+//! don't try to *use* FEC.
 //!
 //! Total UDP payload (header + NAL fragment) is capped at 1400 bytes to stay
 //! comfortably under typical 1500-byte path MTU.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+use reed_solomon_erasure::{galois_8::Field, ReedSolomon};
 
 use crate::protocol::error::ProtocolError;
 
@@ -28,8 +45,12 @@ pub const MAX_DATAGRAM: usize = HEADER_SIZE + MAX_PAYLOAD;
 
 /// `flags` bit: this packet is part of an IDR (keyframe) frame.
 pub const FLAG_KEYFRAME: u8 = 1 << 0;
-/// `flags` bit: this is the last packet in its frame_id (i.e. `packet_index == packet_count - 1`).
+/// `flags` bit: this is the last data packet in its frame_id (i.e.
+/// `packet_index == packet_count - 1`). Set on data packets only.
 pub const FLAG_LAST_IN_FRAME: u8 = 1 << 1;
+/// `flags` bit: this is a parity (FEC) packet, not a data packet.
+/// `packet_index` is in `[0, parity_count)` rather than `[0, packet_count)`.
+pub const FLAG_IS_PARITY: u8 = 1 << 2;
 
 /// Decoded video packet header, host-side representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +59,14 @@ pub struct VideoPacketHeader {
     pub packet_index: u16,
     pub packet_count: u16,
     pub flags: u8,
+    /// Number of FEC parity packets that follow the data packets for this
+    /// frame on the wire. `0` means FEC is not in use for this frame.
+    pub parity_count: u8,
+    /// Actual byte size of the *last* data packet's payload (≤
+    /// `MAX_PAYLOAD`). Always written by the framer; only strictly needed
+    /// when FEC is active, since FEC requires all data shards on the wire
+    /// to be exactly `MAX_PAYLOAD`.
+    pub last_data_size: u16,
     pub timestamp_us: u64,
 }
 
@@ -48,6 +77,9 @@ impl VideoPacketHeader {
     pub fn is_last_in_frame(&self) -> bool {
         self.flags & FLAG_LAST_IN_FRAME != 0
     }
+    pub fn is_parity(&self) -> bool {
+        self.flags & FLAG_IS_PARITY != 0
+    }
 
     /// Serialize the header into the first `HEADER_SIZE` bytes of `out`.
     pub fn write_to(&self, out: &mut [u8; HEADER_SIZE]) {
@@ -55,7 +87,8 @@ impl VideoPacketHeader {
         out[4..6].copy_from_slice(&self.packet_index.to_le_bytes());
         out[6..8].copy_from_slice(&self.packet_count.to_le_bytes());
         out[8] = self.flags;
-        out[9..12].copy_from_slice(&[0u8; 3]); // _pad
+        out[9] = self.parity_count;
+        out[10..12].copy_from_slice(&self.last_data_size.to_le_bytes());
         out[12..20].copy_from_slice(&self.timestamp_us.to_le_bytes());
     }
 
@@ -73,7 +106,8 @@ impl VideoPacketHeader {
             packet_index: u16::from_le_bytes(input[4..6].try_into().expect("2 bytes")),
             packet_count: u16::from_le_bytes(input[6..8].try_into().expect("2 bytes")),
             flags: input[8],
-            // bytes 9..12 are reserved padding; ignored on read
+            parity_count: input[9],
+            last_data_size: u16::from_le_bytes(input[10..12].try_into().expect("2 bytes")),
             timestamp_us: u64::from_le_bytes(input[12..20].try_into().expect("8 bytes")),
         })
     }
@@ -83,9 +117,22 @@ impl VideoPacketHeader {
 /// splits each NAL into one-or-more datagrams, invoking a caller-provided
 /// emit closure for each datagram so the caller can `socket.send(...)` it
 /// directly without intermediate allocation.
-#[derive(Debug, Default)]
+///
+/// Also caches Reed-Solomon encoders by (data_count, parity_count) for the
+/// FEC path ([`Self::frame_with_fec`]).
+#[derive(Default)]
 pub struct VideoFramer {
     next_frame_id: u32,
+    rs_cache: HashMap<(usize, usize), ReedSolomon<Field>>,
+}
+
+impl std::fmt::Debug for VideoFramer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoFramer")
+            .field("next_frame_id", &self.next_frame_id)
+            .field("rs_cache_keys", &self.rs_cache.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl VideoFramer {
@@ -127,6 +174,16 @@ impl VideoFramer {
         // resulting datagrams are still parseable but truncated.
         let count_u16 = u16::try_from(count).unwrap_or(u16::MAX);
 
+        // Size of the last data packet's payload — same value broadcast in
+        // every packet's header so receivers know it without depending on
+        // the last packet to arrive (and to have FEC reconstruct it later).
+        let last_data_size = if nal.is_empty() {
+            0
+        } else {
+            let last_len = nal.len() - (count - 1) * MAX_PAYLOAD;
+            u16::try_from(last_len).unwrap_or(MAX_PAYLOAD as u16)
+        };
+
         let mut buf = [0u8; MAX_DATAGRAM];
         for i in 0..count {
             let off = i * MAX_PAYLOAD;
@@ -146,6 +203,8 @@ impl VideoFramer {
                 packet_index: u16::try_from(i).unwrap_or(u16::MAX),
                 packet_count: count_u16,
                 flags,
+                parity_count: 0,
+                last_data_size,
                 timestamp_us,
             };
             let header_buf: &mut [u8; HEADER_SIZE] = (&mut buf[..HEADER_SIZE])
@@ -157,6 +216,131 @@ impl VideoFramer {
         }
 
         frame_id
+    }
+
+    /// Like [`Self::frame`] but also computes Reed-Solomon parity packets
+    /// at `parity_ratio` redundancy (e.g. `0.10` for 10%). Each shard
+    /// (data and parity) is exactly [`MAX_PAYLOAD`] bytes on the wire so
+    /// reed-solomon's matrix math works; the receiver uses
+    /// `last_data_size` from the header to truncate the recovered NAL.
+    ///
+    /// Emits N data + K parity datagrams in that order. The receiver only
+    /// needs *any* N of the N+K to reconstruct the frame.
+    #[allow(clippy::too_many_lines)]
+    pub fn frame_with_fec<F>(
+        &mut self,
+        nal: &[u8],
+        timestamp_us: u64,
+        is_keyframe: bool,
+        parity_ratio: f32,
+        mut emit: F,
+    ) -> Result<u32, ProtocolError>
+    where
+        F: FnMut(&[u8]),
+    {
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self.next_frame_id.wrapping_add(1);
+
+        let data_count = nal.len().div_ceil(MAX_PAYLOAD).max(1);
+        // Saturate parity_count at u8::MAX-1 (255 is a valid u8 but we want
+        // some headroom; reed-solomon-erasure rejects total_shards > 256
+        // with the default galois_8 field). f64 here so the f32→usize cast
+        // doesn't lose precision for unusually large frames.
+        #[allow(clippy::cast_precision_loss)]
+        let raw_parity =
+            ((data_count as f64 * f64::from(parity_ratio)).ceil() as usize).max(1);
+        let parity_count = raw_parity.min(255_usize.saturating_sub(data_count.min(255)));
+        if data_count + parity_count > 256 {
+            return Err(ProtocolError::Fec(format!(
+                "data ({data_count}) + parity ({parity_count}) > 256 — frame too large for galois_8 RS",
+            )));
+        }
+
+        let last_data_size = if nal.is_empty() {
+            0
+        } else {
+            let last_len = nal.len() - (data_count - 1) * MAX_PAYLOAD;
+            u16::try_from(last_len).unwrap_or(MAX_PAYLOAD as u16)
+        };
+
+        // Build all shards as MAX_PAYLOAD-byte vectors (data + parity).
+        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(data_count + parity_count);
+        for chunk in nal.chunks(MAX_PAYLOAD) {
+            let mut shard = vec![0u8; MAX_PAYLOAD];
+            shard[..chunk.len()].copy_from_slice(chunk);
+            shards.push(shard);
+        }
+        // If `nal` is empty, chunks(MAX_PAYLOAD) yielded nothing — push one
+        // empty data shard so we still have data_count == 1 == shards.len().
+        if shards.is_empty() {
+            shards.push(vec![0u8; MAX_PAYLOAD]);
+        }
+        for _ in 0..parity_count {
+            shards.push(vec![0u8; MAX_PAYLOAD]);
+        }
+
+        let key = (data_count, parity_count);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.rs_cache.entry(key) {
+            let rs = ReedSolomon::<Field>::new(data_count, parity_count)
+                .map_err(|e| ProtocolError::Fec(format!("rs::new({data_count}, {parity_count}): {e:?}")))?;
+            e.insert(rs);
+        }
+        let rs = self.rs_cache.get(&key).expect("just inserted");
+        rs.encode(&mut shards)
+            .map_err(|e| ProtocolError::Fec(format!("rs::encode: {e:?}")))?;
+
+        let count_u16 = u16::try_from(data_count).unwrap_or(u16::MAX);
+        let parity_u8 = u8::try_from(parity_count).unwrap_or(u8::MAX);
+        let mut buf = [0u8; MAX_DATAGRAM];
+
+        // Emit data packets at full MAX_PAYLOAD each.
+        for (i, shard) in shards.iter().enumerate().take(data_count) {
+            let mut flags = 0u8;
+            if is_keyframe {
+                flags |= FLAG_KEYFRAME;
+            }
+            if i + 1 == data_count {
+                flags |= FLAG_LAST_IN_FRAME;
+            }
+            let header = VideoPacketHeader {
+                frame_id,
+                packet_index: u16::try_from(i).unwrap_or(u16::MAX),
+                packet_count: count_u16,
+                flags,
+                parity_count: parity_u8,
+                last_data_size,
+                timestamp_us,
+            };
+            let header_buf: &mut [u8; HEADER_SIZE] = (&mut buf[..HEADER_SIZE])
+                .try_into()
+                .expect("HEADER_SIZE slice");
+            header.write_to(header_buf);
+            buf[HEADER_SIZE..HEADER_SIZE + MAX_PAYLOAD].copy_from_slice(shard);
+            emit(&buf[..HEADER_SIZE + MAX_PAYLOAD]);
+        }
+        // Emit parity packets.
+        for (j, shard) in shards.iter().enumerate().skip(data_count) {
+            let mut flags = FLAG_IS_PARITY;
+            if is_keyframe {
+                flags |= FLAG_KEYFRAME;
+            }
+            let header = VideoPacketHeader {
+                frame_id,
+                packet_index: u16::try_from(j - data_count).unwrap_or(u16::MAX),
+                packet_count: count_u16,
+                flags,
+                parity_count: parity_u8,
+                last_data_size,
+                timestamp_us,
+            };
+            let header_buf: &mut [u8; HEADER_SIZE] = (&mut buf[..HEADER_SIZE])
+                .try_into()
+                .expect("HEADER_SIZE slice");
+            header.write_to(header_buf);
+            buf[HEADER_SIZE..HEADER_SIZE + MAX_PAYLOAD].copy_from_slice(shard);
+            emit(&buf[..HEADER_SIZE + MAX_PAYLOAD]);
+        }
+        Ok(frame_id)
     }
 }
 
@@ -171,21 +355,22 @@ pub struct ReassembledFrame {
     pub nal: Vec<u8>,
 }
 
-/// Internal in-progress assembly slot for one frame_id.
+/// Internal in-progress assembly slot for one frame_id. Unified shape for
+/// both FEC and non-FEC paths: `parity_count == 0` means no FEC and
+/// `parity_shards` is empty.
 struct PendingFrame {
     packet_count: u16,
-    received_count: u16,
-    received: Vec<bool>,
+    parity_count: u8,
+    last_data_size: u16,
     is_keyframe: bool,
     timestamp_us: u64,
-    /// Pre-allocated to `packet_count * MAX_PAYLOAD`. Each packet writes its
-    /// payload at offset `packet_index * MAX_PAYLOAD`; on completion the
-    /// buffer is truncated to the actual NAL length.
-    buffer: Vec<u8>,
-    /// Size in bytes of the final packet's payload, captured when the
-    /// `last_in_frame` packet arrives. Until it does, we don't know the
-    /// total NAL length.
-    last_payload_size: Option<usize>,
+    /// Length = `packet_count`. `Some(bytes)` when received. For FEC each
+    /// is `MAX_PAYLOAD` bytes; for non-FEC the last one may be shorter.
+    data_shards: Vec<Option<Vec<u8>>>,
+    /// Length = `parity_count`. Empty when `parity_count == 0`.
+    parity_shards: Vec<Option<Vec<u8>>>,
+    received_data: u16,
+    received_parity: u16,
 }
 
 /// Per-stream reassembler. Accumulates received UDP datagrams into complete
@@ -204,9 +389,15 @@ pub struct VideoReassembler {
     /// frame is evicted (its packets all arrive too late for it to ever
     /// complete, which on UDP can happen if any of them were dropped).
     max_pending: usize,
+    /// Cached Reed-Solomon decoders by (data_count, parity_count) — same
+    /// keys the framer uses; both sides converge on the same set in
+    /// practice.
+    rs_cache: HashMap<(usize, usize), ReedSolomon<Field>>,
     /// Stats counters, useful for logging and tests.
     pub dropped_old: u64,
     pub dropped_evicted: u64,
+    pub fec_recoveries: u64,
+    pub fec_failures: u64,
 }
 
 impl VideoReassembler {
@@ -216,8 +407,11 @@ impl VideoReassembler {
             pending: BTreeMap::new(),
             latest_completed: None,
             max_pending,
+            rs_cache: HashMap::new(),
             dropped_old: 0,
             dropped_evicted: 0,
+            fec_recoveries: 0,
+            fec_failures: 0,
         }
     }
 
@@ -225,6 +419,7 @@ impl VideoReassembler {
     /// packet completed a frame, `Ok(None)` if the frame is still pending or
     /// the packet was dropped intentionally (stale frame_id, duplicate),
     /// and `Err` if the datagram was malformed.
+    #[allow(clippy::too_many_lines)]
     pub fn ingest(&mut self, datagram: &[u8]) -> Result<Option<ReassembledFrame>, ProtocolError> {
         if datagram.len() > MAX_DATAGRAM {
             return Err(ProtocolError::Oversize {
@@ -236,19 +431,21 @@ impl VideoReassembler {
         if header.packet_count == 0 {
             return Err(ProtocolError::ZeroPacketCount);
         }
-        if header.packet_index >= header.packet_count {
+        let max_index = if header.is_parity() {
+            u16::from(header.parity_count)
+        } else {
+            header.packet_count
+        };
+        if header.packet_index >= max_index {
             return Err(ProtocolError::IndexOutOfRange {
                 index: header.packet_index,
-                count: header.packet_count,
+                count: max_index,
             });
         }
 
         // Discard packets belonging to a frame older than the most recent
-        // completed one. Using wrapping subtraction gives us the right
-        // behaviour at the u32 wraparound (every ~14 hours at 60fps).
+        // completed one.
         if let Some(latest) = self.latest_completed {
-            // diff > 0 if header.frame_id is newer than latest in modular
-            // arithmetic, in the recent half of the u32 space.
             let diff = header.frame_id.wrapping_sub(latest);
             if diff == 0 || diff > u32::MAX / 2 {
                 self.dropped_old += 1;
@@ -258,9 +455,6 @@ impl VideoReassembler {
 
         let payload = &datagram[HEADER_SIZE..];
 
-        // If this is a new frame_id and we're at capacity, evict the oldest
-        // pending entry before inserting. Done before entering the Entry API
-        // so the borrows don't overlap.
         if !self.pending.contains_key(&header.frame_id)
             && self.pending.len() >= self.max_pending
             && let Some((&oldest_id, _)) = self.pending.iter().next()
@@ -272,7 +466,9 @@ impl VideoReassembler {
         let pending = match self.pending.entry(header.frame_id) {
             std::collections::btree_map::Entry::Occupied(o) => {
                 let p = o.into_mut();
-                if p.packet_count != header.packet_count {
+                if p.packet_count != header.packet_count
+                    || p.parity_count != header.parity_count
+                {
                     return Err(ProtocolError::InconsistentPacketCount {
                         frame_id: header.frame_id,
                         previous: p.packet_count,
@@ -283,62 +479,180 @@ impl VideoReassembler {
             }
             std::collections::btree_map::Entry::Vacant(v) => v.insert(PendingFrame {
                 packet_count: header.packet_count,
-                received_count: 0,
-                received: vec![false; header.packet_count as usize],
+                parity_count: header.parity_count,
+                last_data_size: header.last_data_size,
                 is_keyframe: header.is_keyframe(),
                 timestamp_us: header.timestamp_us,
-                buffer: vec![0u8; (header.packet_count as usize) * MAX_PAYLOAD],
-                last_payload_size: None,
+                data_shards: vec![None; header.packet_count as usize],
+                parity_shards: vec![None; header.parity_count as usize],
+                received_data: 0,
+                received_parity: 0,
             }),
         };
 
         let idx = header.packet_index as usize;
-        // Duplicate packet — silently ignore. Common after retransmission
-        // schemes or upstream reorder.
-        if pending.received[idx] {
-            return Ok(None);
+        let is_fec = pending.parity_count > 0;
+
+        if header.is_parity() {
+            // Parity packets are only meaningful for FEC frames.
+            if !is_fec {
+                return Err(ProtocolError::Fec(
+                    "received parity packet but parity_count = 0".into(),
+                ));
+            }
+            if pending.parity_shards[idx].is_some() {
+                return Ok(None); // duplicate
+            }
+            // Parity payloads are always MAX_PAYLOAD.
+            if payload.len() != MAX_PAYLOAD {
+                return Err(ProtocolError::Truncated {
+                    expected: MAX_PAYLOAD,
+                    got: payload.len(),
+                });
+            }
+            pending.parity_shards[idx] = Some(payload.to_vec());
+            pending.received_parity += 1;
+        } else {
+            if pending.data_shards[idx].is_some() {
+                return Ok(None); // duplicate
+            }
+            // Data packet payload size constraints differ by mode.
+            if is_fec {
+                // Every data shard on the wire is MAX_PAYLOAD when FEC is
+                // active; receiver truncates after reassembly.
+                if payload.len() != MAX_PAYLOAD {
+                    return Err(ProtocolError::Truncated {
+                        expected: MAX_PAYLOAD,
+                        got: payload.len(),
+                    });
+                }
+            } else {
+                // Non-FEC: every packet except the final one is MAX_PAYLOAD;
+                // the final one may be shorter.
+                let is_last = header.packet_index + 1 == header.packet_count;
+                if !is_last && payload.len() != MAX_PAYLOAD {
+                    return Err(ProtocolError::Truncated {
+                        expected: MAX_PAYLOAD,
+                        got: payload.len(),
+                    });
+                }
+            }
+            pending.data_shards[idx] = Some(payload.to_vec());
+            pending.received_data += 1;
         }
 
-        // Validate that non-final packets carry exactly MAX_PAYLOAD bytes.
-        // The final packet may be shorter.
-        if header.packet_index + 1 < header.packet_count && payload.len() != MAX_PAYLOAD {
-            return Err(ProtocolError::Truncated {
-                expected: MAX_PAYLOAD,
-                got: payload.len(),
-            });
+        // Completion check.
+        if is_fec {
+            // FEC: any data_count packets out of (data_count + parity_count)
+            // are sufficient.
+            if u32::from(pending.received_data) + u32::from(pending.received_parity)
+                >= u32::from(pending.packet_count)
+            {
+                return self.try_complete_fec(header.frame_id);
+            }
+        } else if pending.received_data == pending.packet_count {
+            return Ok(Some(self.complete_non_fec(header.frame_id)));
         }
+        Ok(None)
+    }
 
-        let off = idx * MAX_PAYLOAD;
-        pending.buffer[off..off + payload.len()].copy_from_slice(payload);
-        pending.received[idx] = true;
-        pending.received_count += 1;
-
-        if header.is_last_in_frame() || header.packet_index + 1 == header.packet_count {
-            pending.last_payload_size = Some(payload.len());
+    fn complete_non_fec(&mut self, frame_id: u32) -> ReassembledFrame {
+        let pending = self
+            .pending
+            .remove(&frame_id)
+            .expect("complete_non_fec called for missing frame");
+        let mut nal = Vec::new();
+        for shard in pending.data_shards {
+            nal.extend_from_slice(&shard.expect("all data shards present"));
         }
+        self.latest_completed = Some(frame_id);
+        ReassembledFrame {
+            frame_id,
+            is_keyframe: pending.is_keyframe,
+            timestamp_us: pending.timestamp_us,
+            nal,
+        }
+    }
 
-        if pending.received_count == pending.packet_count {
-            // We have every packet; finalize.
-            let last_size = pending
-                .last_payload_size
-                .expect("last packet must have arrived if every packet has");
-            let total = (pending.packet_count as usize - 1) * MAX_PAYLOAD + last_size;
-            let mut buffer = std::mem::take(&mut pending.buffer);
-            buffer.truncate(total);
-            let is_keyframe = pending.is_keyframe;
-            let timestamp_us = pending.timestamp_us;
-            self.pending.remove(&header.frame_id);
-            self.latest_completed = Some(header.frame_id);
+    fn try_complete_fec(
+        &mut self,
+        frame_id: u32,
+    ) -> Result<Option<ReassembledFrame>, ProtocolError> {
+        // Borrow scope: extract everything we need from the pending entry,
+        // run RS reconstruct, then remove the entry.
+        let pending = self
+            .pending
+            .get_mut(&frame_id)
+            .expect("try_complete_fec called for missing frame");
+        let data_count = pending.packet_count as usize;
+        let parity_count = pending.parity_count as usize;
+        let last_data_size = pending.last_data_size as usize;
 
+        // If we have all data shards, no need to reconstruct.
+        if pending.received_data == pending.packet_count {
+            let mut nal = Vec::with_capacity(data_count * MAX_PAYLOAD);
+            for shard in &pending.data_shards {
+                nal.extend_from_slice(shard.as_ref().expect("all data shards"));
+            }
+            // Truncate to actual NAL length.
+            let total = (data_count - 1) * MAX_PAYLOAD + last_data_size;
+            nal.truncate(total);
+            let pending = self.pending.remove(&frame_id).unwrap();
+            self.latest_completed = Some(frame_id);
             return Ok(Some(ReassembledFrame {
-                frame_id: header.frame_id,
-                is_keyframe,
-                timestamp_us,
-                nal: buffer,
+                frame_id,
+                is_keyframe: pending.is_keyframe,
+                timestamp_us: pending.timestamp_us,
+                nal,
             }));
         }
 
-        Ok(None)
+        // Otherwise, rebuild a `Vec<Option<Vec<u8>>>` of length data + parity,
+        // run reed-solomon reconstruct.
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(data_count + parity_count);
+        for s in &pending.data_shards {
+            shards.push(s.clone());
+        }
+        for s in &pending.parity_shards {
+            shards.push(s.clone());
+        }
+
+        let key = (data_count, parity_count);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.rs_cache.entry(key) {
+            let rs = ReedSolomon::<Field>::new(data_count, parity_count).map_err(|err| {
+                ProtocolError::Fec(format!("rs::new({data_count}, {parity_count}): {err:?}"))
+            })?;
+            e.insert(rs);
+        }
+        let rs = self.rs_cache.get(&key).expect("just inserted");
+
+        match rs.reconstruct(&mut shards) {
+            Ok(()) => {
+                self.fec_recoveries += 1;
+                let mut nal = Vec::with_capacity(data_count * MAX_PAYLOAD);
+                for shard in shards.iter().take(data_count) {
+                    nal.extend_from_slice(shard.as_ref().expect("reconstructed shard present"));
+                }
+                let total = (data_count - 1) * MAX_PAYLOAD + last_data_size;
+                nal.truncate(total);
+                let pending = self.pending.remove(&frame_id).unwrap();
+                self.latest_completed = Some(frame_id);
+                Ok(Some(ReassembledFrame {
+                    frame_id,
+                    is_keyframe: pending.is_keyframe,
+                    timestamp_us: pending.timestamp_us,
+                    nal,
+                }))
+            }
+            Err(e) => {
+                // Not enough shards to recover (shouldn't happen if our
+                // received_data + received_parity >= packet_count check is
+                // right). Log and drop.
+                self.fec_failures += 1;
+                self.pending.remove(&frame_id);
+                Err(ProtocolError::Fec(format!("rs::reconstruct: {e:?}")))
+            }
+        }
     }
 
     /// Frames currently in flight (not yet completed or evicted).
@@ -363,14 +677,38 @@ mod tests {
             packet_index: 0xabcd,
             packet_count: 0x1234,
             flags: FLAG_KEYFRAME | FLAG_LAST_IN_FRAME,
+            parity_count: 0,
+            last_data_size: 0,
             timestamp_us: 0x0102_0304_0506_0708,
         };
         let mut buf = [0u8; HEADER_SIZE];
         h.write_to(&mut buf);
-        // Padding bytes must be zero.
+        // With FEC inactive (parity_count=0, last_data_size=0), the M7
+        // header is byte-identical to M3's 3-byte-pad layout.
         assert_eq!(&buf[9..12], &[0u8, 0, 0]);
         let parsed = VideoPacketHeader::read_from(&buf).unwrap();
         assert_eq!(parsed, h);
+    }
+
+    #[test]
+    fn header_roundtrip_with_fec_fields() {
+        let h = VideoPacketHeader {
+            frame_id: 7,
+            packet_index: 3,
+            packet_count: 10,
+            flags: FLAG_KEYFRAME | FLAG_IS_PARITY,
+            parity_count: 2,
+            last_data_size: 537,
+            timestamp_us: 999,
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        h.write_to(&mut buf);
+        assert_eq!(buf[9], 2);
+        assert_eq!(u16::from_le_bytes([buf[10], buf[11]]), 537);
+        let parsed = VideoPacketHeader::read_from(&buf).unwrap();
+        assert_eq!(parsed, h);
+        assert!(parsed.is_parity());
+        assert!(parsed.is_keyframe());
     }
 
     #[test]
@@ -507,6 +845,8 @@ mod tests {
             packet_index: 0,
             packet_count: 0,
             flags: 0,
+            parity_count: 0,
+            last_data_size: 0,
             timestamp_us: 0,
         };
         h.write_to(&mut buf);
@@ -522,6 +862,8 @@ mod tests {
             packet_index: 5,
             packet_count: 3,
             flags: 0,
+            parity_count: 0,
+            last_data_size: 0,
             timestamp_us: 0,
         };
         h.write_to(&mut buf);
@@ -554,6 +896,114 @@ mod tests {
         // Frame 0 evicted; 1 and 2 still pending.
         let pending: Vec<u32> = reasm.pending_frames().collect();
         assert_eq!(pending, vec![1, 2]);
+    }
+
+    fn frame_with_fec_collect(
+        framer: &mut VideoFramer,
+        nal: &[u8],
+        ts: u64,
+        keyframe: bool,
+        ratio: f32,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        framer
+            .frame_with_fec(nal, ts, keyframe, ratio, |dg| out.push(dg.to_vec()))
+            .expect("frame_with_fec");
+        out
+    }
+
+    #[test]
+    fn fec_roundtrip_no_loss() {
+        let mut framer = VideoFramer::new();
+        let nal = make_nal(0xa0, MAX_PAYLOAD * 4 + 73);
+        let datagrams = frame_with_fec_collect(&mut framer, &nal, 1234, true, 0.10);
+        // 5 data packets (4 full + 1 short, padded on wire to MAX_PAYLOAD)
+        // + ceil(5 * 0.10) = 1 parity = 6 datagrams.
+        assert_eq!(datagrams.len(), 6);
+
+        let mut reasm = VideoReassembler::new(8);
+        let mut completed = None;
+        for dg in &datagrams {
+            if let Some(f) = reasm.ingest(dg).unwrap() {
+                completed = Some(f);
+            }
+        }
+        let frame = completed.expect("frame should complete");
+        assert_eq!(frame.nal, nal);
+        assert!(frame.is_keyframe);
+        assert_eq!(frame.timestamp_us, 1234);
+    }
+
+    #[test]
+    fn fec_recovers_from_one_data_drop() {
+        let mut framer = VideoFramer::new();
+        let nal = make_nal(0xb0, MAX_PAYLOAD * 4 + 100);
+        // ratio 0.50 -> 5 data + 3 parity = 8 packets; we drop 2 data
+        // and rely on RS to recover.
+        let datagrams = frame_with_fec_collect(&mut framer, &nal, 99, false, 0.50);
+        assert_eq!(datagrams.len(), 8);
+
+        let mut reasm = VideoReassembler::new(8);
+        let mut completed = None;
+        // Skip data packets at indices 1 and 3 (two losses < 3 parity).
+        for (i, dg) in datagrams.iter().enumerate() {
+            if i == 1 || i == 3 {
+                continue;
+            }
+            if let Some(f) = reasm.ingest(dg).unwrap() {
+                completed = Some(f);
+            }
+        }
+        let frame = completed.expect("RS should reconstruct lost data shards");
+        assert_eq!(frame.nal, nal);
+        assert_eq!(reasm.fec_recoveries, 1);
+    }
+
+    #[test]
+    fn fec_recovers_from_one_parity_drop() {
+        let mut framer = VideoFramer::new();
+        let nal = make_nal(0xc0, MAX_PAYLOAD * 3);
+        // 3 data + 1 parity = 4 datagrams; drop the parity, completes
+        // via the all-data fast path (no RS needed).
+        let datagrams = frame_with_fec_collect(&mut framer, &nal, 0, false, 0.10);
+        assert_eq!(datagrams.len(), 4);
+
+        let mut reasm = VideoReassembler::new(8);
+        let mut completed = None;
+        for (i, dg) in datagrams.iter().enumerate() {
+            // Last packet is the parity (data first, then parity).
+            if i == datagrams.len() - 1 {
+                continue;
+            }
+            if let Some(f) = reasm.ingest(dg).unwrap() {
+                completed = Some(f);
+            }
+        }
+        let frame = completed.expect("frame should complete from data alone");
+        assert_eq!(frame.nal, nal);
+        // No RS reconstruct needed since all data shards arrived.
+        assert_eq!(reasm.fec_recoveries, 0);
+    }
+
+    #[test]
+    fn fec_too_much_loss_does_not_complete() {
+        let mut framer = VideoFramer::new();
+        let nal = make_nal(0xd0, MAX_PAYLOAD * 4);
+        // 4 data + 1 parity (10%). Dropping 2 packets exceeds parity.
+        let datagrams = frame_with_fec_collect(&mut framer, &nal, 0, false, 0.10);
+        assert_eq!(datagrams.len(), 5);
+
+        let mut reasm = VideoReassembler::new(8);
+        for (i, dg) in datagrams.iter().enumerate() {
+            if i == 0 || i == 2 {
+                continue;
+            }
+            assert!(reasm.ingest(dg).unwrap().is_none());
+        }
+        // Still pending; RS can't recover with 1 parity but 2 data
+        // missing.
+        assert!(reasm.pending_frames().any(|id| id == 0));
+        assert_eq!(reasm.fec_recoveries, 0);
     }
 
     #[test]

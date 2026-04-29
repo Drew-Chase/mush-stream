@@ -25,4 +25,6 @@ pub enum ProtocolError {
     },
     #[error("unknown control message tag: 0x{0:02x}")]
     UnknownControlTag(u8),
+    #[error("FEC error: {0}")]
+    Fec(String),
 }
