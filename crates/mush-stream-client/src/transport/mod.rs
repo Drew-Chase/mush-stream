@@ -9,6 +9,7 @@
 //!   helpers so M6/M7 don't worry about wire formatting at the call site.
 
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use mush_stream_common::protocol::{
     control::{self, ControlMessage},
@@ -22,17 +23,46 @@ use tokio::sync::mpsc;
 /// evicting the oldest. ~250ms of headroom at 60fps.
 pub const REASM_MAX_PENDING: usize = 16;
 
+/// Don't spam keyframe requests on a sustained drop streak — one per this
+/// interval is enough to ask the encoder for an IDR.
+const KEYFRAME_REQUEST_DEBOUNCE: Duration = Duration::from_millis(200);
+
 /// Drives the video receive loop. Owns the UDP socket and reassembler;
-/// every full frame goes to `out`. Runs until `out` is dropped.
+/// every full frame goes to `out`. When a gap in `frame_id` is detected
+/// (a missed frame), or when the very first frame arrives without being
+/// a keyframe (the client joined an in-flight stream), pushes a
+/// `RequestKeyframe` onto `keyframe_tx` so the host's encoder will emit
+/// an IDR. Rate-limited per [`KEYFRAME_REQUEST_DEBOUNCE`].
 pub async fn run_video_receiver(
     bind: SocketAddr,
     out: mpsc::Sender<ReassembledFrame>,
+    keyframe_tx: Option<mpsc::Sender<crate::input::InputCommand>>,
 ) -> std::io::Result<ReceiverStats> {
+    use crate::input::InputCommand;
     let socket = UdpSocket::bind(bind).await?;
     tracing::info!(%bind, "video receiver ready");
     let mut reasm = VideoReassembler::new(REASM_MAX_PENDING);
     let mut buf = vec![0u8; video::MAX_DATAGRAM];
     let mut stats = ReceiverStats::default();
+    let mut last_complete_id: Option<u32> = None;
+    let mut last_request = Instant::now()
+        .checked_sub(KEYFRAME_REQUEST_DEBOUNCE * 2)
+        .unwrap_or_else(Instant::now);
+
+    let request_keyframe = |reason: &'static str,
+                            last_request: &mut Instant,
+                            stats: &mut ReceiverStats| {
+        let now = Instant::now();
+        if now.duration_since(*last_request) < KEYFRAME_REQUEST_DEBOUNCE {
+            return;
+        }
+        *last_request = now;
+        stats.keyframe_requests_sent += 1;
+        if let Some(tx) = keyframe_tx.as_ref() {
+            let _ = tx.try_send(InputCommand::Control(ControlMessage::RequestKeyframe));
+        }
+        tracing::info!(reason, "requested keyframe from host");
+    };
 
     loop {
         let (len, _from) = match socket.recv_from(&mut buf).await {
@@ -48,6 +78,32 @@ pub async fn run_video_receiver(
         match reasm.ingest(&buf[..len]) {
             Ok(Some(frame)) => {
                 stats.frames_completed += 1;
+                // Detect loss / mid-stream join.
+                match (last_complete_id, frame.is_keyframe) {
+                    (None, false) => {
+                        request_keyframe(
+                            "joined mid-stream (first frame is not IDR)",
+                            &mut last_request,
+                            &mut stats,
+                        );
+                    }
+                    (Some(prev), _) => {
+                        let diff = frame.frame_id.wrapping_sub(prev);
+                        // Forward gap: more than one frame_id ahead.
+                        // diff in (1, MAX/2) means ahead-and-recent;
+                        // exactly 1 means consecutive (no gap).
+                        if diff > 1 && diff < u32::MAX / 2 {
+                            stats.detected_gaps += 1;
+                            request_keyframe(
+                                "frame_id gap detected",
+                                &mut last_request,
+                                &mut stats,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                last_complete_id = Some(frame.frame_id);
                 if out.send(frame).await.is_err() {
                     break;
                 }
@@ -76,6 +132,8 @@ pub struct ReceiverStats {
     pub malformed: u64,
     pub dropped_old: u64,
     pub dropped_evicted: u64,
+    pub detected_gaps: u64,
+    pub keyframe_requests_sent: u64,
 }
 
 /// UDP socket pre-connected to the host's input/control listener. Cheap to

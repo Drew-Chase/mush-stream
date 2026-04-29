@@ -69,8 +69,10 @@ fn main() -> Result<()> {
         })
         .context("spawning decode thread")?;
 
-    // Channel: gamepad thread → network thread.
+    // Channel: input producers (gamepad thread, video receiver via
+    // detected-loss → keyframe request) → network thread.
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<InputCommand>(64);
+    let keyframe_tx = input_tx.clone();
 
     // Gamepad thread (250 Hz). Always spawn; it'll log + exit cleanly if
     // gilrs init fails or no pad is attached.
@@ -105,7 +107,7 @@ fn main() -> Result<()> {
                     }
                 };
                 let receive = tokio::spawn(async move {
-                    match run_video_receiver(video_bind, frame_tx).await {
+                    match run_video_receiver(video_bind, frame_tx, Some(keyframe_tx)).await {
                         Ok(stats) => tracing::info!(?stats, "video receiver stopped"),
                         Err(e) => tracing::error!(error = %e, "video receiver failed"),
                     }
