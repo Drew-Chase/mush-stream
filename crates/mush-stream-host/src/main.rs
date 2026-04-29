@@ -13,7 +13,6 @@ mod transport;
 mod vigem;
 
 use std::{
-    ffi::OsString,
     fs::File,
     io::BufWriter,
     path::{Path, PathBuf},
@@ -23,6 +22,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use mush_stream_common::protocol::{
     control::ControlMessage, input::InputPacket, video::VideoFramer,
 };
@@ -35,7 +35,6 @@ use crate::encode::{Mp4Recorder, VideoEncoder};
 use crate::transport::{run_input_receiver, run_video_sender, VIDEO_SEND_CHANNEL};
 use crate::vigem::VirtualGamepad;
 
-const DEFAULT_CONFIG_PATH: &str = "./host.toml";
 const PNG_OUTPUT_PATH: &str = "./capture-debug.png";
 const MP4_OUTPUT_PATH: &str = "./capture-debug.mp4";
 const FIRST_FRAME_MAX_ATTEMPTS: u32 = 60;
@@ -48,6 +47,38 @@ enum Mode {
     Png,
 }
 
+/// `mush-stream-host` — desktop capture, NVENC encode, UDP stream to client.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Stream video over UDP to the configured peer (default).
+    #[arg(long, group = "mode")]
+    stream: bool,
+    /// Record 5 seconds of capture to ./capture-debug.mp4 (M2 verification).
+    #[arg(long, group = "mode")]
+    mp4: bool,
+    /// Capture one frame to ./capture-debug.png (M1 verification of the
+    /// crop rectangle).
+    #[arg(long, group = "mode")]
+    png: bool,
+    /// Path to the host TOML config.
+    #[arg(default_value = "./host.toml")]
+    config: PathBuf,
+}
+
+impl Cli {
+    fn mode(&self) -> Mode {
+        if self.png {
+            Mode::Png
+        } else if self.mp4 {
+            Mode::Mp4
+        } else {
+            // Default and explicit --stream.
+            Mode::Stream
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -55,7 +86,9 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let (mode, config_path) = parse_args(std::env::args_os());
+    let cli = Cli::parse();
+    let mode = cli.mode();
+    let config_path = cli.config;
     tracing::info!(path = %config_path.display(), ?mode, "loading config");
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
@@ -80,28 +113,6 @@ fn main() -> Result<()> {
         Mode::Mp4 => record_to_mp4(cfg.capture.output_index, rect, &cfg.encode),
         Mode::Stream => run_stream(cfg, rect),
     }
-}
-
-fn parse_args<I, S>(args: I) -> (Mode, PathBuf)
-where
-    I: IntoIterator<Item = S>,
-    S: Into<OsString>,
-{
-    let mut mode = Mode::Stream;
-    let mut config_path: Option<PathBuf> = None;
-    for arg in args.into_iter().skip(1) {
-        let arg: OsString = arg.into();
-        if arg == "--png" {
-            mode = Mode::Png;
-        } else if arg == "--mp4" {
-            mode = Mode::Mp4;
-        } else if arg == "--stream" {
-            mode = Mode::Stream;
-        } else {
-            config_path = Some(PathBuf::from(arg));
-        }
-    }
-    (mode, config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)))
 }
 
 /// M1: capture one frame, save as PNG.

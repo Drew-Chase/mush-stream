@@ -18,14 +18,10 @@ mod display;
 mod input;
 mod transport;
 
-use std::{
-    ffi::OsString,
-    path::PathBuf,
-    sync::atomic::AtomicBool,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::atomic::AtomicBool, sync::Arc};
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use mush_stream_common::protocol::video::ReassembledFrame;
 use tracing_subscriber::EnvFilter;
 use winit::event_loop::EventLoopProxy;
@@ -36,7 +32,16 @@ use crate::display::{DisplayApp, UserEvent};
 use crate::input::{run_gamepad_loop, InputCommand};
 use crate::transport::{run_input_sender, run_video_receiver, InputSender};
 
-const DEFAULT_CONFIG_PATH: &str = "./client.toml";
+/// `mush-stream-client` — receives streamed video over UDP, decodes via
+/// ffmpeg, presents via winit + pixels, and forwards gamepad input to the
+/// host.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Path to the client TOML config.
+    #[arg(default_value = "./client.toml")]
+    config: PathBuf,
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -45,7 +50,8 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let config_path = parse_config_path(std::env::args_os());
+    let cli = Cli::parse();
+    let config_path = cli.config;
     tracing::info!(path = %config_path.display(), "loading config");
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading client config from {}", config_path.display()))?;
@@ -152,18 +158,6 @@ fn main() -> Result<()> {
         "client exiting"
     );
     Ok(())
-}
-
-fn parse_config_path<I, S>(args: I) -> PathBuf
-where
-    I: IntoIterator<Item = S>,
-    S: Into<OsString>,
-{
-    args.into_iter()
-        .skip(1)
-        .map(|a| PathBuf::from(a.into()))
-        .next()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
 }
 
 /// Decodes reassembled NAL frames and forwards decoded RGBA frames to the
