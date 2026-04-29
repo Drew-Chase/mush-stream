@@ -101,6 +101,14 @@ fn main() -> Result<()> {
     tracing::info!(
         frames_presented = app.stats.frames_presented,
         last_glass_to_glass_us = ?app.stats.last_glass_to_glass_us,
+        cumulative_min_us = if app.stats.cumulative_samples > 0 {
+            app.stats.cumulative_min_us
+        } else {
+            0
+        },
+        cumulative_max_us = app.stats.cumulative_max_us,
+        cumulative_avg_us = ?app.stats.cumulative_avg_us(),
+        cumulative_samples = app.stats.cumulative_samples,
         "client exiting"
     );
     Ok(())

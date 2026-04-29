@@ -30,11 +30,72 @@ pub enum UserEvent {
     WorkerExited,
 }
 
-/// Latency stats observed at present time. M5 fills these in.
+/// Latency stats observed at present time.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PresentStats {
     pub frames_presented: u64,
     pub last_glass_to_glass_us: Option<u64>,
+    pub cumulative_min_us: u64,
+    pub cumulative_max_us: u64,
+    pub cumulative_sum_us: u64,
+    pub cumulative_samples: u64,
+}
+
+impl PresentStats {
+    pub fn cumulative_avg_us(&self) -> Option<u64> {
+        (self.cumulative_samples > 0)
+            .then(|| self.cumulative_sum_us / self.cumulative_samples)
+    }
+}
+
+/// Rolling window of glass-to-glass latency samples. Logs a percentile
+/// snapshot each time the window fills.
+#[derive(Debug)]
+struct LatencyTracker {
+    capacity: usize,
+    samples: Vec<u64>,
+}
+
+impl LatencyTracker {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            samples: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn record(&mut self, us: u64) -> Option<LatencySnapshot> {
+        self.samples.push(us);
+        if self.samples.len() < self.capacity {
+            return None;
+        }
+        self.samples.sort_unstable();
+        let n = self.samples.len();
+        let pct = |p: f64| self.samples[((n as f64 - 1.0) * p).round() as usize];
+        let snap = LatencySnapshot {
+            count: n as u64,
+            min_us: self.samples[0],
+            p50_us: pct(0.50),
+            p95_us: pct(0.95),
+            p99_us: pct(0.99),
+            max_us: self.samples[n - 1],
+            avg_us: self.samples.iter().sum::<u64>() / n as u64,
+        };
+        self.samples.clear();
+        Some(snap)
+    }
+}
+
+/// One window's worth of latency stats — logged at info level.
+#[derive(Debug, Clone, Copy)]
+pub struct LatencySnapshot {
+    pub count: u64,
+    pub min_us: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+    pub avg_us: u64,
 }
 
 pub struct DisplayApp {
@@ -42,19 +103,26 @@ pub struct DisplayApp {
     window: Option<&'static Window>,
     pixels: Option<Pixels<'static>>,
     last_frame: Option<DecodedFrame>,
-    /// Wallclock at the time of the last presented frame's capture.
-    /// Updated each redraw so external observers can read latency.
+    /// Cumulative present stats; observers can read this after exit.
     pub stats: PresentStats,
+    latency_tracker: LatencyTracker,
 }
 
 impl DisplayApp {
     pub fn new(config: DisplayConfig) -> Self {
+        // Window of 60 samples ≈ 1 second at 60fps. Logs a snapshot per
+        // window so glass-to-glass percentiles are visible at info level
+        // without flooding for every frame.
         Self {
             config,
             window: None,
             pixels: None,
             last_frame: None,
-            stats: PresentStats::default(),
+            stats: PresentStats {
+                cumulative_min_us: u64::MAX,
+                ..PresentStats::default()
+            },
+            latency_tracker: LatencyTracker::new(60),
         }
     }
 }
@@ -124,14 +192,35 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
                     } else {
                         self.stats.frames_presented += 1;
                         // Glass-to-glass: time from host capture to client
-                        // present. M5 reads these from the proxy thread or
-                        // the on-shutdown drain.
+                        // present. host and client must share a clock for
+                        // the absolute number to be meaningful — fine on
+                        // localhost (M5 target); for cross-machine M4+
+                        // testing rely on Tailscale + NTP.
                         let now_us = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_micros() as u64)
                             .unwrap_or(0);
                         let delta = now_us.saturating_sub(frame.timestamp_us);
                         self.stats.last_glass_to_glass_us = Some(delta);
+                        self.stats.cumulative_min_us =
+                            self.stats.cumulative_min_us.min(delta);
+                        self.stats.cumulative_max_us =
+                            self.stats.cumulative_max_us.max(delta);
+                        self.stats.cumulative_sum_us =
+                            self.stats.cumulative_sum_us.saturating_add(delta);
+                        self.stats.cumulative_samples += 1;
+                        if let Some(snap) = self.latency_tracker.record(delta) {
+                            tracing::info!(
+                                count = snap.count,
+                                min_us = snap.min_us,
+                                p50_us = snap.p50_us,
+                                p95_us = snap.p95_us,
+                                p99_us = snap.p99_us,
+                                max_us = snap.max_us,
+                                avg_us = snap.avg_us,
+                                "glass-to-glass latency window"
+                            );
+                        }
                     }
                 }
             }
