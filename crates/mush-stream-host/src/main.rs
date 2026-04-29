@@ -10,6 +10,7 @@ mod capture;
 mod config;
 mod encode;
 mod transport;
+mod vigem;
 
 use std::{
     ffi::OsString,
@@ -22,7 +23,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use mush_stream_common::protocol::video::VideoFramer;
+use mush_stream_common::protocol::{
+    control::ControlMessage, input::InputPacket, video::VideoFramer,
+};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -30,6 +33,7 @@ use crate::capture::{CaptureError, CaptureRect, Capturer};
 use crate::config::Config;
 use crate::encode::{Mp4Recorder, VideoEncoder};
 use crate::transport::{run_input_receiver, run_video_sender, VIDEO_SEND_CHANNEL};
+use crate::vigem::VirtualGamepad;
 
 const DEFAULT_CONFIG_PATH: &str = "./host.toml";
 const PNG_OUTPUT_PATH: &str = "./capture-debug.png";
@@ -174,6 +178,10 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
     runtime.block_on(async move {
         let (datagram_tx, datagram_rx) = mpsc::channel(VIDEO_SEND_CHANNEL);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
+        // Channels for the inbound dispatcher to forward to the right
+        // worker. Bounded so a stalled worker doesn't grow memory.
+        let (gamepad_tx, gamepad_rx) = std::sync::mpsc::sync_channel::<InputPacket>(256);
+        let (control_tx, control_rx) = std::sync::mpsc::sync_channel::<ControlMessage>(64);
 
         let video_bind = cfg.network.video_bind;
         let peer = cfg.network.peer;
@@ -211,6 +219,7 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
                     fps,
                     bitrate_bps,
                     datagram_tx,
+                    control_rx,
                     shutdown_for_capture,
                 ) {
                     tracing::error!(error = %e, "capture+encode loop exited with error");
@@ -218,17 +227,30 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
             })
             .context("spawning capture+encode thread")?;
 
-        // Inbound dispatcher: keyframe requests forward to encode (M7),
-        // disconnect logs and stops, input packets go to ViGEm in M6.
-        // For M4 we just log them.
+        // ViGEm thread: applies received InputPackets to a virtual Xbox 360.
+        // Connects lazily — if the driver is missing, log and skip without
+        // breaking video streaming.
+        let vigem_handle = std::thread::Builder::new()
+            .name("mush-vigem".into())
+            .spawn(move || {
+                run_vigem_loop(gamepad_rx);
+            })
+            .context("spawning vigem thread")?;
+
+        // Inbound dispatcher: route Input packets to the ViGEm thread and
+        // ControlMessages to the encode thread (request_keyframe / shutdown).
         let inbound_handle = tokio::spawn(async move {
             while let Some(msg) = inbound_rx.recv().await {
                 match msg {
                     transport::InboundFromClient::Control(c) => {
-                        tracing::info!(?c, "control message from client");
+                        tracing::debug!(?c, "control message from client");
+                        let _ = control_tx.try_send(c);
                     }
-                    transport::InboundFromClient::Input(_) => {
-                        // M6: forward to ViGEm. Log-only for now.
+                    transport::InboundFromClient::Input(p) => {
+                        // try_send so a stalled ViGEm doesn't back-pressure
+                        // the UDP receiver. Drop on full is acceptable for
+                        // 250Hz polling — next packet supersedes anyway.
+                        let _ = gamepad_tx.try_send(p);
                     }
                 }
             }
@@ -245,6 +267,7 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
         // network task naturally). spawn_blocking lets us await std::thread.
         let _ = tokio::task::spawn_blocking(move || {
             let _ = encode_handle.join();
+            let _ = vigem_handle.join();
         })
         .await;
         sender.abort();
@@ -262,6 +285,7 @@ fn run_capture_encode_loop(
     fps: u32,
     bitrate_bps: u64,
     datagram_tx: mpsc::Sender<Vec<u8>>,
+    control_rx: std::sync::mpsc::Receiver<ControlMessage>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut capturer =
@@ -275,8 +299,25 @@ fn run_capture_encode_loop(
     let mut have_first_frame = false;
     let mut pts: i64 = 0;
     let mut dropped_full_channel: u64 = 0;
+    let mut keyframes_forced: u64 = 0;
 
     while !shutdown.load(Ordering::Acquire) {
+        // Drain pending control messages before encoding the next frame.
+        // Coalesce: multiple RequestKeyframes between frames just flag
+        // keyframe once.
+        while let Ok(msg) = control_rx.try_recv() {
+            match msg {
+                ControlMessage::RequestKeyframe => {
+                    encoder.request_keyframe();
+                    keyframes_forced += 1;
+                }
+                ControlMessage::Disconnect => {
+                    tracing::info!("client requested disconnect; encode loop exiting");
+                    shutdown.store(true, Ordering::Release);
+                }
+            }
+        }
+
         match capturer.next_frame_bgra(FIRST_FRAME_MAX_ATTEMPTS) {
             Ok(bgra) => {
                 last_frame.copy_from_slice(bgra);
@@ -346,8 +387,41 @@ fn run_capture_encode_loop(
         })
         .context("flushing encoder on shutdown")?;
 
-    tracing::info!(dropped_full_channel, "encode loop exiting");
+    tracing::info!(
+        dropped_full_channel,
+        keyframes_forced,
+        "encode loop exiting"
+    );
     Ok(())
+}
+
+/// Drains the gamepad input channel, applying each packet to the virtual
+/// Xbox 360. Connects lazily; if ViGEm isn't available we log and exit.
+fn run_vigem_loop(rx: std::sync::mpsc::Receiver<InputPacket>) {
+    let mut pad = match VirtualGamepad::connect() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ViGEm connect failed; gamepad passthrough disabled \
+                (install ViGEmBus and reconnect to enable)"
+            );
+            // Drain the channel so the inbound dispatcher's try_send doesn't
+            // back up, but otherwise do nothing.
+            while rx.recv().is_ok() {}
+            return;
+        }
+    };
+    while let Ok(packet) = rx.recv() {
+        if let Err(e) = pad.apply(packet) {
+            tracing::warn!(error = %e, "ViGEm apply failed");
+        }
+    }
+    tracing::info!(
+        accepted = pad.accepted(),
+        dropped_old = pad.dropped_old(),
+        "ViGEm loop exiting"
+    );
 }
 
 /// Convert tightly-packed BGRA → RGBA into a fresh buffer and write as PNG.
