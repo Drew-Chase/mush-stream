@@ -29,6 +29,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 png = "0.17"
 ffmpeg-the-third = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
+winit = "0.30"
+pixels = "0.14"
+gilrs = "0.10"
+vigem-client = "0.1"
+reed-solomon-erasure = "6"
 
 mush-stream-common = { path = "crates/mush-stream-common" }
 
