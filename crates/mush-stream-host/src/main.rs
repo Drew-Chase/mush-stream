@@ -23,7 +23,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::capture::{CaptureError, CaptureRect, Capturer};
 use crate::config::Config;
-use crate::encode::VideoRecorder;
+use crate::encode::Mp4Recorder;
 
 const DEFAULT_CONFIG_PATH: &str = "./host.toml";
 const PNG_OUTPUT_PATH: &str = "./capture-debug.png";
@@ -122,7 +122,7 @@ fn record_to_mp4(
 
     let mut capturer = Capturer::new(output_index, rect)
         .context("initializing DXGI desktop duplication capturer")?;
-    let mut recorder = VideoRecorder::new(
+    let mut recorder = Mp4Recorder::new(
         Path::new(MP4_OUTPUT_PATH),
         rect.width,
         rect.height,

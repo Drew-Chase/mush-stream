@@ -1,12 +1,15 @@
-//! NVENC H.264 encoding + MP4 muxing via `ffmpeg-the-third`.
+//! NVENC H.264 encoding via `ffmpeg-the-third`.
 //!
-//! Milestone 2: takes BGRA frames from the capture stage, hands them to
-//! `h264_nvenc` (which accepts packed BGRA input directly and converts to NV12
-//! internally), and writes the result to an MP4 container.
+//! Two consumers:
+//! - [`VideoEncoder`] is the low-level pipe — BGRA in, encoded packets out
+//!   via a caller-supplied closure. Used by the M4 streaming path.
+//! - [`Mp4Recorder`] wraps a `VideoEncoder` together with an MP4 muxer for
+//!   the M2 capture-to-file verification mode.
 //!
-//! The CPU-readback intermediate (BGRA bytes) is the M2 trade-off so we don't
-//! have to write a BGRA→NV12 D3D11 shader before having a working pipeline.
-//! M5/M7 will revisit GPU-resident path once we're optimizing latency.
+//! NVENC accepts packed BGRA input directly (`AV_PIX_FMT_BGR0`) and converts
+//! to NV12 internally on the GPU. The CPU-side BGRA round-trip from the
+//! capture stage will be lifted to D3D11 hwframes in M5/M7 once latency is
+//! the focus.
 
 use std::path::Path;
 
@@ -26,11 +29,6 @@ pub enum EncodeError {
         and an NVIDIA GPU driver is installed"
     )]
     NvencNotFound,
-    #[error(
-        "h264_nvenc found but it does not advertise itself as a video encoder \
-        (this would indicate a broken ffmpeg build)"
-    )]
-    NotVideoEncoder,
     #[error(
         "BGRA frame size mismatch: expected {expected} bytes ({width}x{height}*4), got {got}"
     )]
@@ -60,54 +58,43 @@ impl<T> FfErrCtx<T> for Result<T, ffmpeg::Error> {
     }
 }
 
-/// Encodes BGRA frames to an MP4 file via h264_nvenc.
-pub struct VideoRecorder {
-    output: format::context::Output,
+/// Low-level NVENC encoder. Takes BGRA frames in, emits encoded
+/// packets via a closure on each `push_bgra` call.
+pub struct VideoEncoder {
     encoder: codec::encoder::video::Encoder,
     encoder_time_base: Rational,
-    stream_time_base: Rational,
-    stream_index: usize,
     frame: frame::Video,
     packet: Packet,
     width: u32,
     height: u32,
+    /// Set by [`Self::request_keyframe`]; consumed and cleared by the next
+    /// `push_bgra` to mark the input frame as an I-frame so NVENC emits an
+    /// IDR. Used by M7's keyframe-on-loss recovery.
+    force_keyframe_next: bool,
 }
 
-impl VideoRecorder {
-    /// Opens an MP4 at `path`, configures NVENC per the project spec
-    /// (preset p1, tune ll, zerolatency, no B-frames), writes the format
-    /// header, and returns a recorder ready to accept frames.
+impl VideoEncoder {
+    /// Create and open a fresh NVENC encoder.
+    ///
+    /// `global_header = true` causes SPS/PPS to live in the codec context's
+    /// `extradata` (required for MP4 muxing). For UDP streaming, leave this
+    /// `false` so SPS/PPS are emitted inline at every IDR — the client's
+    /// decoder can then bootstrap from any keyframe without needing to
+    /// receive a separate "extradata" channel.
     pub fn new(
-        path: &Path,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_bps: u64,
+        global_header: bool,
     ) -> Result<Self, EncodeError> {
         ffmpeg::init().map_err(EncodeError::Init)?;
 
         let codec = codec::encoder::find_by_name("h264_nvenc")
             .ok_or(EncodeError::NvencNotFound)?;
 
-        let mut output = format::output(&path).ff("format::output")?;
         let encoder_tb = Rational(1, fps as i32);
 
-        // Add the stream and remember its index; the StreamMut borrows the
-        // output, so we drop it before configuring the encoder.
-        let stream_index = {
-            let mut stream = output.add_stream(codec).ff("add_stream")?;
-            stream.set_time_base(encoder_tb);
-            stream.index()
-        };
-
-        // Whether the muxer wants codec extradata in the global header
-        // (true for MP4) — the encoder must emit SPS/PPS out-of-band.
-        let global_header = output
-            .format()
-            .flags()
-            .contains(format::flag::Flags::GLOBAL_HEADER);
-
-        // Build, configure, and open the encoder.
         let mut enc_ctx = codec::Context::new_with_codec(codec)
             .encoder()
             .video()
@@ -129,47 +116,54 @@ impl VideoRecorder {
         opts.set("preset", "p1");
         opts.set("tune", "ll");
         opts.set("zerolatency", "1");
+        // M5 tuning: turn off VBV strict for steadier latency.
+        opts.set("rc", "cbr");
+        opts.set("delay", "0");
+        opts.set("rc-lookahead", "0");
+        opts.set("no-scenecut", "1");
 
         let encoder = enc_ctx.open_with(opts).ff("open_with(NVENC opts)")?;
 
-        // Copy params (codec id, extradata, dimensions, etc.) into the stream.
-        {
-            let mut stream = output
-                .stream_mut(stream_index)
-                .expect("stream just added must be retrievable by index");
-            stream.copy_parameters_from_context(&encoder);
-        }
-
-        output.write_header().ff("write_header")?;
-
-        // After write_header the muxer may have rewritten the stream's time
-        // base (MP4 typically uses 1/timescale, not 1/fps). Read what stuck.
-        let stream_time_base = output
-            .stream(stream_index)
-            .expect("stream still present after write_header")
-            .time_base();
-
         let mut frame = frame::Video::new(Pixel::BGR0, width, height);
-        // Initial pts; per-frame push will overwrite.
         frame.set_pts(Some(0));
 
         Ok(Self {
-            output,
             encoder,
             encoder_time_base: encoder_tb,
-            stream_time_base,
-            stream_index,
             frame,
             packet: Packet::empty(),
             width,
             height,
+            force_keyframe_next: false,
         })
     }
 
-    /// Pushes one BGRA frame at the given pts (in encoder time base, i.e.
-    /// frame number when the time base is `1/fps`). Drains any packets the
-    /// encoder produces.
-    pub fn push_bgra(&mut self, bgra: &[u8], pts: i64) -> Result<(), EncodeError> {
+    pub fn time_base(&self) -> Rational {
+        self.encoder_time_base
+    }
+
+    /// Mark the next encoded frame as an IDR. The encoder will emit SPS/PPS
+    /// + an I-frame on the very next `push_bgra` regardless of GOP timing.
+    /// Used by M7 to recover from packet loss without waiting for the next
+    /// scheduled keyframe.
+    pub fn request_keyframe(&mut self) {
+        self.force_keyframe_next = true;
+    }
+
+    /// Encode one BGRA frame at the given pts (in encoder time base, i.e.
+    /// frame index when the time base is `1/fps`). For each encoded packet
+    /// produced, invokes `on_packet` with `&mut Packet`. The caller may read
+    /// the packet bytes (`packet.data()`) for streaming, or mutate
+    /// `stream_index`/`pts`/`dts` and call `write_interleaved` for muxing.
+    pub fn push_bgra<F>(
+        &mut self,
+        bgra: &[u8],
+        pts: i64,
+        on_packet: F,
+    ) -> Result<(), EncodeError>
+    where
+        F: FnMut(&mut Packet) -> Result<(), EncodeError>,
+    {
         let expected = (self.width as usize) * (self.height as usize) * 4;
         if bgra.len() != expected {
             return Err(EncodeError::BgraSize {
@@ -180,12 +174,11 @@ impl VideoRecorder {
             });
         }
 
+        // Copy BGRA into the AVFrame respecting any line-pitch padding.
         let row_bytes = (self.width as usize) * 4;
         let stride = self.frame.stride(0);
         let height = self.height as usize;
         let dst = self.frame.data_mut(0);
-        // ffmpeg's frame buffer may pad rows past `width*4`; copy row-by-row
-        // so we always honor `linesize[0]`.
         for row in 0..height {
             let src_row = &bgra[row * row_bytes..(row + 1) * row_bytes];
             let dst_off = row * stride;
@@ -193,38 +186,154 @@ impl VideoRecorder {
         }
 
         self.frame.set_pts(Some(pts));
+
+        // Forced-keyframe path for M7. ffmpeg-the-third's `frame::Video`
+        // doesn't expose `set_pict_type` directly, so we poke the AVFrame
+        // through the raw pointer. SAFETY: we hold `&mut self.frame` and the
+        // pointer is valid for the lifetime of the frame.
+        if self.force_keyframe_next {
+            unsafe {
+                let raw = self.frame.as_mut_ptr();
+                (*raw).pict_type = ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                (*raw).key_frame = 1;
+            }
+            self.force_keyframe_next = false;
+        } else {
+            // Reset to NONE so the encoder is free to choose.
+            unsafe {
+                let raw = self.frame.as_mut_ptr();
+                (*raw).pict_type = ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
+                (*raw).key_frame = 0;
+            }
+        }
+
         self.encoder.send_frame(&self.frame).ff("send_frame")?;
-        self.drain_packets()?;
-        Ok(())
+        self.drain_packets(on_packet)
     }
 
-    fn drain_packets(&mut self) -> Result<(), EncodeError> {
+    /// Flush pending packets after `send_eof`. Call exactly once at the end
+    /// of the stream; the encoder is left in a closed state.
+    pub fn finish<F>(&mut self, on_packet: F) -> Result<(), EncodeError>
+    where
+        F: FnMut(&mut Packet) -> Result<(), EncodeError>,
+    {
+        self.encoder.send_eof().ff("send_eof")?;
+        self.drain_packets(on_packet)
+    }
+
+    fn drain_packets<F>(&mut self, mut on_packet: F) -> Result<(), EncodeError>
+    where
+        F: FnMut(&mut Packet) -> Result<(), EncodeError>,
+    {
         loop {
             match self.encoder.receive_packet(&mut self.packet) {
-                Ok(()) => {
-                    self.packet.set_stream(self.stream_index);
-                    self.packet
-                        .rescale_ts(self.encoder_time_base, self.stream_time_base);
-                    self.packet
-                        .write_interleaved(&mut self.output)
-                        .ff("write_interleaved")?;
-                }
-                // EAGAIN ("send more frames") and EOF (end of drain) both end
-                // the receive loop. Any other Other{} we treat the same way:
-                // ffmpeg's receive_packet contract reserves Other for those.
+                Ok(()) => on_packet(&mut self.packet)?,
+                // EAGAIN ("send more frames") and EOF (end of drain) both
+                // end the receive loop; ffmpeg's contract on receive_packet
+                // reserves Other{} for those.
                 Err(ffmpeg::Error::Eof) => break,
                 Err(ffmpeg::Error::Other { .. }) => break,
-                Err(e) => return Err(EncodeError::Ffmpeg { context: "receive_packet", source: e }),
+                Err(e) => {
+                    return Err(EncodeError::Ffmpeg {
+                        context: "receive_packet",
+                        source: e,
+                    });
+                }
             }
         }
         Ok(())
     }
+}
 
-    /// Flushes the encoder, drains remaining packets, writes the trailer,
-    /// and closes the file. Consumes `self`.
+/// MP4-recording wrapper used by `--mp4` mode. Owns a [`VideoEncoder`] plus
+/// an MP4 output muxer.
+pub struct Mp4Recorder {
+    encoder: VideoEncoder,
+    output: format::context::Output,
+    stream_index: usize,
+    stream_time_base: Rational,
+}
+
+impl Mp4Recorder {
+    pub fn new(
+        path: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_bps: u64,
+    ) -> Result<Self, EncodeError> {
+        ffmpeg::init().map_err(EncodeError::Init)?;
+
+        // Need to know whether the muxer wants global_header before we
+        // configure the encoder. Open the output first.
+        let mut output = format::output(&path).ff("format::output")?;
+        let global_header = output
+            .format()
+            .flags()
+            .contains(format::flag::Flags::GLOBAL_HEADER);
+
+        let encoder = VideoEncoder::new(width, height, fps, bitrate_bps, global_header)?;
+        let encoder_tb = encoder.time_base();
+
+        // Add the stream after the encoder is built (need codec ptr from
+        // find_by_name; available via ffmpeg's global registry).
+        let codec_unknown = codec::encoder::find_by_name("h264_nvenc")
+            .ok_or(EncodeError::NvencNotFound)?;
+        let stream_index = {
+            let mut stream = output.add_stream(codec_unknown).ff("add_stream")?;
+            stream.set_time_base(encoder_tb);
+            stream.index()
+        };
+
+        // Copy SPS/PPS extradata from the opened encoder into the stream.
+        {
+            let mut stream = output
+                .stream_mut(stream_index)
+                .expect("stream just added must be retrievable by index");
+            stream.copy_parameters_from_context(&encoder.encoder);
+        }
+
+        output.write_header().ff("write_header")?;
+
+        let stream_time_base = output
+            .stream(stream_index)
+            .expect("stream still present after write_header")
+            .time_base();
+
+        Ok(Self {
+            encoder,
+            output,
+            stream_index,
+            stream_time_base,
+        })
+    }
+
+    pub fn push_bgra(&mut self, bgra: &[u8], pts: i64) -> Result<(), EncodeError> {
+        let stream_index = self.stream_index;
+        let encoder_tb = self.encoder.encoder_time_base;
+        let stream_tb = self.stream_time_base;
+        let output = &mut self.output;
+        self.encoder.push_bgra(bgra, pts, |packet| {
+            packet.set_stream(stream_index);
+            packet.rescale_ts(encoder_tb, stream_tb);
+            packet
+                .write_interleaved(output)
+                .ff("write_interleaved")
+        })
+    }
+
     pub fn finish(mut self) -> Result<(), EncodeError> {
-        self.encoder.send_eof().ff("send_eof")?;
-        self.drain_packets()?;
+        let stream_index = self.stream_index;
+        let encoder_tb = self.encoder.encoder_time_base;
+        let stream_tb = self.stream_time_base;
+        let output = &mut self.output;
+        self.encoder.finish(|packet| {
+            packet.set_stream(stream_index);
+            packet.rescale_ts(encoder_tb, stream_tb);
+            packet
+                .write_interleaved(output)
+                .ff("write_interleaved")
+        })?;
         self.output.write_trailer().ff("write_trailer")?;
         Ok(())
     }
