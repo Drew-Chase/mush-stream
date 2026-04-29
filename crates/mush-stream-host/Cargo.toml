@@ -17,6 +17,8 @@ tracing-subscriber = { workspace = true }
 png = { workspace = true }
 ffmpeg-the-third = { workspace = true }
 tokio = { workspace = true }
+vigem-client = { workspace = true }
+reed-solomon-erasure = { workspace = true }
 
 [lints]
 workspace = true

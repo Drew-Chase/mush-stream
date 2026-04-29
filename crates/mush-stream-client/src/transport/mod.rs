@@ -110,3 +110,32 @@ impl InputSender {
         self.socket.send(&buf).await.map(|_| ())
     }
 }
+
+/// Drains the input channel and sends each command to the host. Owns the
+/// `InputSender` so the underlying UDP socket lives for the task's
+/// lifetime.
+pub async fn run_input_sender(
+    sender: InputSender,
+    mut rx: mpsc::Receiver<crate::input::InputCommand>,
+) {
+    use crate::input::InputCommand;
+    let mut input_sent = 0u64;
+    let mut control_sent = 0u64;
+    let mut send_errors = 0u64;
+    while let Some(cmd) = rx.recv().await {
+        let res = match cmd {
+            InputCommand::Input(p) => sender.send_input(p).await.map(|_| input_sent += 1),
+            InputCommand::Control(c) => sender.send_control(c).await.map(|_| control_sent += 1),
+        };
+        if let Err(e) = res {
+            send_errors += 1;
+            tracing::warn!(error = %e, "input/control send failed");
+        }
+    }
+    tracing::info!(
+        input_sent,
+        control_sent,
+        send_errors,
+        "input sender stopped"
+    );
+}

@@ -17,6 +17,8 @@ tokio = { workspace = true }
 ffmpeg-the-third = { workspace = true }
 winit = { workspace = true }
 pixels = { workspace = true }
+gilrs = { workspace = true }
+reed-solomon-erasure = { workspace = true }
 
 [lints]
 workspace = true

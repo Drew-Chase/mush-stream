@@ -15,11 +15,13 @@
 mod config;
 mod decode;
 mod display;
+mod input;
 mod transport;
 
 use std::{
     ffi::OsString,
     path::PathBuf,
+    sync::atomic::AtomicBool,
     sync::Arc,
 };
 
@@ -31,7 +33,8 @@ use winit::event_loop::EventLoopProxy;
 use crate::config::{Config, DecodeConfig, DisplayConfig};
 use crate::decode::VideoDecoder;
 use crate::display::{DisplayApp, UserEvent};
-use crate::transport::run_video_receiver;
+use crate::input::{run_gamepad_loop, InputCommand};
+use crate::transport::{run_input_sender, run_video_receiver, InputSender};
 
 const DEFAULT_CONFIG_PATH: &str = "./client.toml";
 
@@ -66,9 +69,27 @@ fn main() -> Result<()> {
         })
         .context("spawning decode thread")?;
 
+    // Channel: gamepad thread → network thread.
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<InputCommand>(64);
+
+    // Gamepad thread (250 Hz). Always spawn; it'll log + exit cleanly if
+    // gilrs init fails or no pad is attached.
+    let gamepad_shutdown = Arc::new(AtomicBool::new(false));
+    let gamepad_shutdown_for_thread = gamepad_shutdown.clone();
+    let gamepad_thread = std::thread::Builder::new()
+        .name("mush-input".into())
+        .spawn(move || {
+            if let Err(e) = run_gamepad_loop(input_tx, gamepad_shutdown_for_thread) {
+                tracing::error!(error = %e, "gamepad loop exited with error");
+            }
+        })
+        .context("spawning gamepad thread")?;
+
     // Network thread (own a tokio runtime so async UDP works).
     let video_bind = cfg.network.video_bind;
-    let net_runtime = tokio::runtime::Builder::new_current_thread()
+    let host_input_addr = cfg.network.host_input_addr;
+    let net_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .context("building network runtime")?;
@@ -76,10 +97,25 @@ fn main() -> Result<()> {
         .name("mush-net".into())
         .spawn(move || {
             net_runtime.block_on(async move {
-                match run_video_receiver(video_bind, frame_tx).await {
-                    Ok(stats) => tracing::info!(?stats, "video receiver stopped"),
-                    Err(e) => tracing::error!(error = %e, "video receiver failed"),
-                }
+                let input_sender = match InputSender::connect(host_input_addr).await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::error!(error = %e, "input sender bind failed");
+                        None
+                    }
+                };
+                let receive = tokio::spawn(async move {
+                    match run_video_receiver(video_bind, frame_tx).await {
+                        Ok(stats) => tracing::info!(?stats, "video receiver stopped"),
+                        Err(e) => tracing::error!(error = %e, "video receiver failed"),
+                    }
+                });
+                let send = tokio::spawn(async move {
+                    if let Some(sender) = input_sender {
+                        run_input_sender(sender, input_rx).await;
+                    }
+                });
+                let _ = tokio::join!(receive, send);
             });
         })
         .context("spawning network thread")?;
@@ -95,8 +131,10 @@ fn main() -> Result<()> {
     // runtime — left as M7 hardening since today the OS reclaims everything
     // on process exit anyway.
     drop(proxy);
+    gamepad_shutdown.store(true, std::sync::atomic::Ordering::Release);
     let _ = decode_thread; // detach
     let _ = net_thread; // detach
+    let _ = gamepad_thread; // detach
 
     tracing::info!(
         frames_presented = app.stats.frames_presented,
