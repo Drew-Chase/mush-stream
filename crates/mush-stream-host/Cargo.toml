@@ -19,6 +19,8 @@ ffmpeg-the-third = { workspace = true }
 tokio = { workspace = true }
 vigem-client = { workspace = true }
 reed-solomon-erasure = { workspace = true }
+clap = { workspace = true }
+upnpc-rs = { workspace = true }
 
 [dev-dependencies]
 # tokio::test(start_paused) for deterministic timing tests in pacer.rs.
