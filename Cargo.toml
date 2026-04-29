@@ -30,7 +30,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 png = "0.17"
 ffmpeg-the-third = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
-winit = "0.30"
+# winit 0.30 defaults pull in wayland/x11; we're Windows-only. Pin rwh_05
+# explicitly so winit's `Window` exposes the raw-window-handle 0.5 traits
+# that pixels 0.14 still requires.
+winit = { version = "0.30", default-features = false, features = ["rwh_05", "rwh_06"] }
 pixels = "0.14"
 gilrs = "0.10"
 vigem-client = "0.1"
