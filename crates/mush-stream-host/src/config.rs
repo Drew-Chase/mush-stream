@@ -8,11 +8,10 @@ use thiserror::Error;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub capture: CaptureConfig,
-    // `network` and `encode` are loaded but unused in M1; they exist now so the
-    // schema is stable across milestones and editing `host.toml` once is enough.
+    // `network` is loaded but unused until M3; declared now so the schema is
+    // stable across milestones.
     #[allow(dead_code)]
     pub network: NetworkConfig,
-    #[allow(dead_code)]
     pub encode: EncodeConfig,
 }
 
@@ -35,9 +34,9 @@ pub struct NetworkConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct EncodeConfig {
     pub bitrate_kbps: u32,
+    pub fps: u32,
 }
 
 #[derive(Debug, Error)]
@@ -83,6 +82,9 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "encode.bitrate_kbps must be > 0".into(),
             ));
+        }
+        if self.encode.fps == 0 {
+            return Err(ConfigError::Invalid("encode.fps must be > 0".into()));
         }
         Ok(())
     }

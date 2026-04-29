@@ -28,6 +28,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 png = "0.17"
+ffmpeg-the-third = "3"
 
 mush-stream-common = { path = "crates/mush-stream-common" }
 

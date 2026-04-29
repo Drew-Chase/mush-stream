@@ -24,3 +24,7 @@ peer = "100.64.0.2:9001"
 [encode]
 # H.264 NVENC target bitrate in kbps. 20 Mbps is a reasonable LAN/Tailscale default.
 bitrate_kbps = 20000
+# Capture/encode framerate. Match (or be a divisor of) the host's display
+# refresh rate. DXGI delivers frames at the display's refresh; setting fps
+# higher than that won't produce more real frames.
+fps = 60

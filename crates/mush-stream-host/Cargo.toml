@@ -15,6 +15,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 png = { workspace = true }
+ffmpeg-the-third = { workspace = true }
 
 [lints]
 workspace = true
