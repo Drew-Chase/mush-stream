@@ -18,6 +18,13 @@ pub struct NetworkConfig {
     pub video_bind: SocketAddr,
     /// Address of the host's input/control listener.
     pub host_input_addr: SocketAddr,
+    /// When true, attempt to forward `video_bind`'s UDP port through the
+    /// local router via UPnP at startup, so the host can reach us
+    /// without manual port forwarding. Defaults to false (matching the
+    /// spec's "use Tailscale, no NAT traversal" stance — flip on only
+    /// if you're not behind a VPN).
+    #[serde(default)]
+    pub enable_upnp: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

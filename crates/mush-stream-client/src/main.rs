@@ -17,6 +17,7 @@ mod decode;
 mod display;
 mod input;
 mod transport;
+mod upnp;
 
 use std::{path::PathBuf, sync::atomic::AtomicBool, sync::Arc};
 
@@ -31,6 +32,7 @@ use crate::decode::VideoDecoder;
 use crate::display::{DisplayApp, UserEvent};
 use crate::input::{run_gamepad_loop, InputCommand};
 use crate::transport::{run_input_sender, run_video_receiver, InputSender};
+use crate::upnp::UpnpForward;
 
 /// `mush-stream-client` — receives streamed video over UDP, decodes via
 /// ffmpeg, presents via winit + pixels, and forwards gamepad input to the
@@ -55,6 +57,14 @@ fn main() -> Result<()> {
     tracing::info!(path = %config_path.display(), "loading config");
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading client config from {}", config_path.display()))?;
+
+    // Optional UPnP port forwarding for the video receive port, held for
+    // the lifetime of main. Drop unmaps the port at process exit.
+    let _upnp_guard = if cfg.network.enable_upnp {
+        UpnpForward::try_forward_udp(cfg.network.video_bind.port(), "mush-stream-client video")
+    } else {
+        None
+    };
 
     let (event_loop, proxy) = display::build_event_loop()?;
     let (frame_tx, frame_rx) =

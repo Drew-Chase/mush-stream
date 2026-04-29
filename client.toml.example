@@ -10,6 +10,11 @@ video_bind = "0.0.0.0:9001"
 # Address of the host's input/control listener (typically a Tailscale IP).
 # Must match the host's [network] input_bind from the host's perspective.
 host_input_addr = "100.64.0.1:9002"
+# When true, the client attempts to forward `video_bind`'s UDP port
+# through the local router via UPnP at startup, so the host can reach
+# you without manual port forwarding. Only flip on if you're not on
+# Tailscale (or another VPN); router must have UPnP enabled.
+enable_upnp = false
 
 [display]
 # Pixel buffer dimensions. Match the host's capture rect to avoid scaling.

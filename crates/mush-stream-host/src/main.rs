@@ -10,6 +10,7 @@ mod capture;
 mod config;
 mod encode;
 mod transport;
+mod upnp;
 mod vigem;
 
 use std::{
@@ -33,6 +34,7 @@ use crate::capture::{CaptureError, CaptureRect, Capturer};
 use crate::config::Config;
 use crate::encode::{Mp4Recorder, VideoEncoder};
 use crate::transport::{run_input_receiver, run_video_sender, VIDEO_SEND_CHANNEL};
+use crate::upnp::UpnpForward;
 use crate::vigem::VirtualGamepad;
 
 const PNG_OUTPUT_PATH: &str = "./capture-debug.png";
@@ -181,6 +183,15 @@ fn record_to_mp4(
 
 /// M4+: capture+encode → UDP stream to peer. Runs until Ctrl+C.
 fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
+    // Optional UPnP port forwarding for the input/control listener so a
+    // remote client behind NAT can reach the host without manual port
+    // forwarding. Held for the lifetime of `run_stream`; Drop unmaps.
+    let _upnp_guard = if cfg.network.enable_upnp {
+        UpnpForward::try_forward_udp(cfg.network.input_bind.port(), "mush-stream-host input")
+    } else {
+        None
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

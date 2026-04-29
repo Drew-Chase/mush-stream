@@ -31,6 +31,13 @@ pub struct NetworkConfig {
     pub video_bind: SocketAddr,
     pub input_bind: SocketAddr,
     pub peer: SocketAddr,
+    /// When true, attempt to forward `input_bind`'s UDP port through the
+    /// local router via UPnP at startup, so a remote client can reach
+    /// us without manual port forwarding. Defaults to false (matching
+    /// the spec's "use Tailscale, no NAT traversal" stance — flip on
+    /// only if you're not behind a VPN).
+    #[serde(default)]
+    pub enable_upnp: bool,
 }
 
 #[derive(Debug, Deserialize)]

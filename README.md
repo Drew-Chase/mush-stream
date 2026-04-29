@@ -168,9 +168,24 @@ cargo run -p mush-stream-host -- --stream ./host.toml
 
 ## Networking
 
-No NAT traversal is built in. Use [Tailscale](https://tailscale.com/) — both
-sides bind to a configurable interface, and Tailscale handles encryption and
-peer discovery.
+The recommended path is [Tailscale](https://tailscale.com/) — both sides
+bind to a configurable interface, and Tailscale handles encryption and
+peer discovery. No further configuration needed beyond pointing each
+side's config at the other's Tailscale IP.
+
+### Optional: UPnP port forwarding
+
+If you're not on Tailscale and your router supports UPnP, set
+`[network] enable_upnp = true` in either `host.toml` or `client.toml`
+and the corresponding side will request a UDP port mapping at startup
+(host forwards `input_bind`, client forwards `video_bind`). The mapping
+is removed on graceful shutdown via an RAII guard. UPnP failures are
+logged and otherwise ignored — the binary continues to run, you just
+won't be reachable from outside the LAN until you configure forwarding
+manually.
+
+UPnP traffic is unencrypted; if you care about that, stick with
+Tailscale.
 
 ## Tests
 
