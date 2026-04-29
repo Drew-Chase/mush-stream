@@ -1,0 +1,26 @@
+# mush-stream host config
+#
+# Copy this file to `host.toml` and edit. The host binary loads `./host.toml`
+# by default; pass a path as the first CLI arg to override.
+
+[capture]
+# Index of the DXGI output to capture. 0 = primary monitor.
+output_index = 0
+# Top-left corner of the capture region, in pixels, relative to the chosen output.
+x = 2560
+y = 0
+# Size of the capture region, in pixels.
+width = 2560
+height = 1440
+
+[network]
+# UDP socket the host binds for sending video to the client.
+video_bind = "0.0.0.0:9001"
+# UDP socket the host binds for receiving gamepad input from the client.
+input_bind = "0.0.0.0:9002"
+# The client's video receive address (typically a Tailscale IP).
+peer = "100.64.0.2:9001"
+
+[encode]
+# H.264 NVENC target bitrate in kbps. 20 Mbps is a reasonable LAN/Tailscale default.
+bitrate_kbps = 20000
