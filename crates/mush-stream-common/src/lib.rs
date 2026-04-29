@@ -1,4 +1,6 @@
 //! Shared types for `mush-stream`.
 //!
-//! Populated in milestone 3 with packet headers, input frames, and error types
-//! shared between the host and client crates.
+//! Currently exposes the wire [`protocol`] (video framing/reassembly, input
+//! packets, control messages) used by the host and client crates.
+
+pub mod protocol;
