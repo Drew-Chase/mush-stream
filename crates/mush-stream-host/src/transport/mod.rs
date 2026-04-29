@@ -5,12 +5,18 @@
 //!   datagrams via an mpsc channel (the encode thread fragments NAL units
 //!   into datagrams via [`mush_stream_common::protocol::video::VideoFramer`]
 //!   and pushes them in) and sends them to the configured peer address.
+//!   Sends are paced through a [`TokenBucket`] so encoder bursts don't
+//!   micro-flood the receiver.
 //! - **input + control client→host** ([`run_input_receiver`]): listens on
 //!   the input port, dispatches by datagram size — 16 bytes is an
 //!   [`InputPacket`], 1 byte is a [`ControlMessage`] — and forwards parsed
 //!   events to the rest of the host via an mpsc channel.
 
+pub mod pacer;
+
 use std::net::SocketAddr;
+
+pub use self::pacer::TokenBucket;
 
 use mush_stream_common::protocol::{
     self,
@@ -27,18 +33,40 @@ pub type VideoDatagram = Vec<u8>;
 pub const VIDEO_SEND_CHANNEL: usize = 256;
 
 /// Drives the video send loop. Owns the UDP socket; reads datagrams from
-/// `rx` and `socket.send`s each one to `peer`. Runs until `rx` closes.
+/// `rx`, awaits the [`TokenBucket`] for shaping, and `socket.send`s each
+/// one to `peer`. Runs until `rx` closes.
+///
+/// `target_bps` is bytes/sec for the pacer. Pass the configured bitrate
+/// (already converted from kbps to bytes/sec) plus any headroom factor.
+/// Set to 0 to disable pacing.
 pub async fn run_video_sender(
     bind: SocketAddr,
     peer: SocketAddr,
     mut rx: mpsc::Receiver<VideoDatagram>,
+    target_bps: u64,
 ) -> std::io::Result<TransportStats> {
     let socket = UdpSocket::bind(bind).await?;
     socket.connect(peer).await?;
-    tracing::info!(%bind, %peer, "video sender ready");
+    // ~12 packets at 1400 bytes each = 16 800 bytes. Lets short encoder
+    // bursts go out at line rate while still smoothing the average.
+    let mut pacer = if target_bps > 0 {
+        Some(TokenBucket::new(16_800, target_bps))
+    } else {
+        None
+    };
+    tracing::info!(
+        %bind,
+        %peer,
+        target_bps,
+        pacing = pacer.is_some(),
+        "video sender ready"
+    );
 
     let mut stats = TransportStats::default();
     while let Some(datagram) = rx.recv().await {
+        if let Some(b) = pacer.as_mut() {
+            b.take(datagram.len() as u64).await;
+        }
         match socket.send(&datagram).await {
             Ok(n) => {
                 stats.packets_sent += 1;

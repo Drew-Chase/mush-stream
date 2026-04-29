@@ -186,10 +186,13 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
         let video_bind = cfg.network.video_bind;
         let peer = cfg.network.peer;
         let input_bind = cfg.network.input_bind;
+        // 1.25× headroom over the encoder's target so the pacer doesn't
+        // stall the queue if NVENC briefly overshoots.
+        let pacer_bps = (u64::from(cfg.encode.bitrate_kbps) * 1000 / 8) * 5 / 4;
 
         // UDP send task.
         let sender = tokio::spawn(async move {
-            match run_video_sender(video_bind, peer, datagram_rx).await {
+            match run_video_sender(video_bind, peer, datagram_rx, pacer_bps).await {
                 Ok(stats) => tracing::info!(?stats, "video sender stopped"),
                 Err(e) => tracing::error!(error = %e, "video sender failed"),
             }
