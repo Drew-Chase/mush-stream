@@ -9,4 +9,5 @@ pub mod config;
 pub mod decode;
 pub mod display;
 pub mod input;
+pub mod runner;
 pub mod transport;

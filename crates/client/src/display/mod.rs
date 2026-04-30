@@ -398,10 +398,19 @@ fn estimate_bitrate_bps(window: &VecDeque<(Instant, usize)>) -> f64 {
 
 /// Build the winit event loop. Returns the loop together with a proxy that
 /// worker threads can use to push events.
+///
+/// On Windows the loop is built with `with_any_thread(true)` so the
+/// caller can drive `run_app` from a non-main thread — required for
+/// the Tauri shell, which reserves the main thread for its webview.
+/// The binary uses the same path so behaviour stays uniform.
 pub fn build_event_loop() -> Result<(EventLoop<UserEvent>, EventLoopProxy<UserEvent>)> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .context("building winit event loop")?;
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        builder.with_any_thread(true);
+    }
+    let event_loop = builder.build().context("building winit event loop")?;
     let proxy = event_loop.create_proxy();
     Ok((event_loop, proxy))
 }
