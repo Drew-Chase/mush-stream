@@ -40,6 +40,20 @@ pub const VIDEO_SEND_CHANNEL: usize = 256;
 /// volume is small (input + control) but mirroring the client's setting
 /// keeps either side from being a surprise bottleneck.
 pub const UDP_RECV_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// 4 MiB UDP send buffer. Default Windows SO_SNDBUF is small enough
+/// that a keyframe burst (~150 KB at 9 Mbps × 1440p) can hit kernel
+/// back-pressure mid-flush, adding tail latency to the late packets
+/// of every IDR. Lifting it lets the burst clear before the pacer's
+/// next refill cycle.
+pub const UDP_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Token-bucket capacity for the send-side pacer, in bytes. Sized to
+/// hold the largest expected single keyframe (a 9 Mbps × 1440p IDR
+/// is typically 80–150 KB; 256 KB gives headroom for higher bitrates
+/// and motion-heavy content). When the bucket is at least one
+/// keyframe deep, every IDR drains in one burst rather than dribbling
+/// out behind token refill — that's the single biggest source of p99
+/// tail latency at GOP boundaries.
+pub const PACER_CAPACITY_BYTES: u64 = 256 * 1024;
 
 /// One parsed message coming up from the listen socket.
 #[derive(Debug)]
@@ -69,6 +83,13 @@ fn bind_listen_socket(listen_port: u16) -> std::io::Result<UdpSocket> {
             error = %e,
             requested = UDP_RECV_BUFFER_BYTES,
             "failed to enlarge UDP recv buffer; using OS default"
+        );
+    }
+    if let Err(e) = socket.set_send_buffer_size(UDP_SEND_BUFFER_BYTES) {
+        tracing::warn!(
+            error = %e,
+            requested = UDP_SEND_BUFFER_BYTES,
+            "failed to enlarge UDP send buffer; using OS default"
         );
     }
     socket.bind(&bind.into())?;
@@ -187,10 +208,11 @@ async fn run_send_loop(
     target_bps: u64,
 ) -> std::io::Result<TransportStats> {
     let mut stats = TransportStats::default();
-    // ~12 packets at 1400 bytes each = 16 800 bytes. Lets short encoder
-    // bursts go out at line rate while still smoothing the average.
+    // Sized to hold one full keyframe (see PACER_CAPACITY_BYTES). The
+    // pacer's job is to keep the long-run rate bounded; per-frame
+    // shaping is the kernel's job, and the kernel does it better.
     let mut pacer = if target_bps > 0 {
-        Some(TokenBucket::new(16_800, target_bps))
+        Some(TokenBucket::new(PACER_CAPACITY_BYTES, target_bps))
     } else {
         None
     };
