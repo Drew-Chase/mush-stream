@@ -16,11 +16,13 @@ import {
   configLoadClient,
   configLoadHost,
   hostAddresses as fetchHostAddresses,
+  hostPeer as fetchHostPeer,
   hostStatus as fetchHostStatus,
   installUpdateAndRelaunch,
   logsBuffer as fetchLogsBuffer,
   onAppLog,
   onClientState,
+  onHostPeer,
   onHostState,
   recentsList as fetchRecents,
   systemProbe,
@@ -28,6 +30,7 @@ import {
   type ClientState,
   type ClientStateEvent,
   type HostConfig,
+  type HostPeerEvent,
   type HostState,
   type HostStateEvent,
   type LogLine,
@@ -46,6 +49,11 @@ interface AppStateShape {
   hostError: string | null;
   hostAddresses: ShareAddresses | null;
   hostConfig: HostConfig | null;
+  /** Currently bound client peer for the active host session
+   *  (`"ip:port"`), or `null` when no client has connected yet. Driven
+   *  by the backend's `host:peer` event, mirrored on the AppState
+   *  Mutex so a page reload can recover via the `host_peer` query. */
+  hostPeer: string | null;
   clientState: ClientState;
   clientAddress: string | null;
   clientError: string | null;
@@ -92,6 +100,7 @@ export function HostingProvider({ children }: { children: ReactNode }) {
   const [hostError, setHostError] = useState<string | null>(null);
   const [hostAddrs, setHostAddrs] = useState<ShareAddresses | null>(null);
   const [hostCfg, setHostCfg] = useState<HostConfig | null>(null);
+  const [hostPeer, setHostPeer] = useState<string | null>(null);
   const [clientState, setClientState] = useState<ClientState>("idle");
   const [clientAddress, setClientAddress] = useState<string | null>(null);
   const [clientError, setClientError] = useState<string | null>(null);
@@ -199,6 +208,7 @@ export function HostingProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let alive = true;
     let unlistenHost: (() => void) | null = null;
+    let unlistenHostPeer: (() => void) | null = null;
     let unlistenClient: (() => void) | null = null;
     let unlistenLog: (() => void) | null = null;
 
@@ -223,6 +233,12 @@ export function HostingProvider({ children }: { children: ReactNode }) {
       try {
         const hs = await fetchHostStatus();
         if (alive) setHostState(hs);
+      } catch {
+        /* ignore */
+      }
+      try {
+        const peer = await fetchHostPeer();
+        if (alive) setHostPeer(peer);
       } catch {
         /* ignore */
       }
@@ -254,6 +270,10 @@ export function HostingProvider({ children }: { children: ReactNode }) {
         setHostState(ev.state);
         setHostError(ev.error);
       });
+      unlistenHostPeer = await onHostPeer((ev: HostPeerEvent) => {
+        if (!alive) return;
+        setHostPeer(ev.address);
+      });
       unlistenClient = await onClientState((ev: ClientStateEvent) => {
         if (!alive) return;
         setClientState(ev.state);
@@ -267,6 +287,7 @@ export function HostingProvider({ children }: { children: ReactNode }) {
     return () => {
       alive = false;
       unlistenHost?.();
+      unlistenHostPeer?.();
       unlistenClient?.();
       unlistenLog?.();
     };
@@ -292,6 +313,7 @@ export function HostingProvider({ children }: { children: ReactNode }) {
       hostError,
       hostAddresses: hostAddrs,
       hostConfig: hostCfg,
+      hostPeer,
       clientState,
       clientAddress,
       clientError,
@@ -321,6 +343,7 @@ export function HostingProvider({ children }: { children: ReactNode }) {
       hostError,
       hostAddrs,
       hostCfg,
+      hostPeer,
       clientState,
       clientAddress,
       clientError,

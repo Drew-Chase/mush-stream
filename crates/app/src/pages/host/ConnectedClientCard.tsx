@@ -3,15 +3,16 @@ import { Card, Tag } from "../../components/primitives";
 import { useHosting } from "../../hosting";
 
 /**
- * Connected-client card. Currently a placeholder: the host crate
- * doesn't yet emit `host:peer` events to the Tauri shell, so we
- * just toggle between "Stream is offline" and "Waiting for first
- * packet…" based on lifecycle state. Real peer info will land here
- * once the host_session runner threads peer events through.
+ * Connected-client card. The host runner's UDP recv loop emits
+ * `host:peer` events to the Tauri shell whenever it observes a peer
+ * change (first packet, port rotation, or session end); the hosting
+ * provider mirrors the latest into `hostPeer`. We render three
+ * states: offline, broadcasting-but-no-peer, and connected.
  */
 export default function ConnectedClientCard() {
-  const { hostState } = useHosting();
+  const { hostState, hostPeer } = useHosting();
   const live = hostState === "broadcasting";
+  const connected = live && hostPeer !== null;
 
   return (
     <Card>
@@ -19,14 +20,30 @@ export default function ConnectedClientCard() {
         <span className="cardhd__t">
           <IcGamepad size={13} /> Connected client
         </span>
-        <Tag kind="def">none</Tag>
+        {connected ? (
+          <Tag kind="live">1 client</Tag>
+        ) : (
+          <Tag kind="def">none</Tag>
+        )}
       </div>
-      <div className="peer__empty">
-        {live ? "Waiting for first packet…" : "Stream is offline"}
-        <span className="mono">
-          Host learns peer address from inbound UDP
-        </span>
-      </div>
+      {connected ? (
+        <div className="peer">
+          <div className="peer__av" aria-hidden="true">
+            <IcGamepad size={16} />
+          </div>
+          <div className="peer__main">
+            <div className="peer__name">Client</div>
+            <div className="peer__addr">{hostPeer}</div>
+          </div>
+        </div>
+      ) : (
+        <div className="peer__empty">
+          {live ? "Waiting for first packet…" : "Stream is offline"}
+          <span className="mono">
+            Host learns peer address from inbound UDP
+          </span>
+        </div>
+      )}
     </Card>
   );
 }

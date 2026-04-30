@@ -173,6 +173,22 @@ export const hostStart = () => invoke<void>("host_start");
 export const hostStop = () => invoke<void>("host_stop");
 export const hostStatus = () => invoke<HostState>("host_status");
 
+/**
+ * Push notification fired by the backend when the bound client peer
+ * for the active host session changes. `address` is `"ip:port"` once
+ * the host sees a client's first packet (or when the peer rotates to
+ * a new ephemeral port), and `null` at session end so the UI can
+ * clear any "currently connected" indicator.
+ */
+export interface HostPeerEvent {
+  address: string | null;
+}
+
+/** Pull the current host-session peer (returns null when no session
+ *  is running, or when running but no client packet has arrived yet).
+ *  Used on mount to recover state after a page reload. */
+export const hostPeer = () => invoke<string | null>("host_peer");
+
 export type ClientState =
   | "idle"
   | "connecting"
@@ -213,6 +229,9 @@ export const logsBuffer = () => invoke<LogLine[]>("logs_buffer");
 
 export const onHostState = (cb: (e: HostStateEvent) => void): Promise<UnlistenFn> =>
   listen<HostStateEvent>("host:state", (ev) => cb(ev.payload));
+
+export const onHostPeer = (cb: (e: HostPeerEvent) => void): Promise<UnlistenFn> =>
+  listen<HostPeerEvent>("host:peer", (ev) => cb(ev.payload));
 
 export const onClientState = (
   cb: (e: ClientStateEvent) => void,

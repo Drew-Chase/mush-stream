@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use mush_stream_host::capture::CaptureRect;
 use mush_stream_host::runner;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::configs;
 use crate::state::AppState;
@@ -33,6 +33,17 @@ pub enum HostState {
 pub struct HostStateEvent {
     pub state: HostState,
     pub error: Option<String>,
+}
+
+/// Push notification fired when the bound client peer changes during
+/// a host session. `address` is `Some("ip:port")` once the host has
+/// observed the first inbound packet (or the peer rotates to a new
+/// ephemeral port), and `None` at session end so the frontend can
+/// clear any "currently connected" UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostPeerEvent {
+    pub address: Option<String>,
 }
 
 pub struct HostSession {
@@ -95,6 +106,29 @@ pub async fn host_start(
     let shutdown_for_thread = shutdown.clone();
     let app_for_thread = app.clone();
 
+    // Build the peer-change observer the host runner will invoke from
+    // its UDP recv loop. The closure must be `'static + Send + Sync`,
+    // so we capture an `AppHandle` (cheaply cloneable) and resolve the
+    // managed `AppState` per-call via the handle. That keeps the live
+    // UI updated (via `host:peer` event) and the shared mirror fresh
+    // for the `host_peer` pull command after a page reload.
+    let app_for_peer = app.clone();
+    let peer_observer: mush_stream_host::transport::PeerObserver =
+        Arc::new(move |peer: Option<std::net::SocketAddr>| {
+            let formatted = peer.map(|addr| addr.to_string());
+            if let Some(state) = app_for_peer.try_state::<AppState>()
+                && let Ok(mut guard) = state.host_peer.lock()
+            {
+                (*guard).clone_from(&formatted);
+            }
+            let _ = app_for_peer.emit(
+                "host:peer",
+                HostPeerEvent {
+                    address: formatted,
+                },
+            );
+        });
+
     let thread = std::thread::Builder::new()
         .name("mush-host-runner".into())
         .spawn(move || {
@@ -107,7 +141,13 @@ pub async fn host_start(
             // `handle_ctrl_c = false`: the Tauri parent process owns
             // its own signal handling; we don't want the runner
             // installing a competing handler.
-            let result = runner::run_stream_blocking(cfg, rect, shutdown_for_thread, false);
+            let result = runner::run_stream_blocking(
+                cfg,
+                rect,
+                shutdown_for_thread,
+                false,
+                Some(peer_observer),
+            );
             match result {
                 Ok(()) => {
                     tracing::info!("host streaming session stopped cleanly");
@@ -179,6 +219,19 @@ pub async fn host_status(state: State<'_, AppState>) -> Result<HostState, String
     } else {
         HostState::Idle
     })
+}
+
+/// Query the most recently observed peer for the active host session.
+/// Returns `None` when no session is running, or when a session is
+/// running but no client has sent a packet yet. Used by the frontend
+/// on mount to recover the connected-client UI after a page reload.
+#[tauri::command]
+pub async fn host_peer(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let guard = state
+        .host_peer
+        .lock()
+        .map_err(|e| format!("host_peer lock poisoned: {e}"))?;
+    Ok(guard.clone())
 }
 
 fn emit_state(app: &AppHandle, state: HostState, error: Option<String>) {

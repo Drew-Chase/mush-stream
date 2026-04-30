@@ -48,6 +48,12 @@ pub struct AppState {
     pub host: Mutex<Option<HostSession>>,
     pub client: Mutex<Option<ClientSession>>,
     pub recents: Mutex<Vec<RecentEntry>>,
+    /// Most recently observed peer for the active host session, as a
+    /// formatted "ip:port" string. Updated from inside the host
+    /// transport's recv loop via the `host:peer` callback installed in
+    /// `host_session::host_start`. Cleared on session end. Surfaced to
+    /// the frontend both push (event) and pull (`host_peer` command).
+    pub host_peer: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -57,6 +63,7 @@ impl AppState {
             host: Mutex::new(None),
             client: Mutex::new(None),
             recents: Mutex::new(Vec::new()),
+            host_peer: Mutex::new(None),
         }
     }
 }

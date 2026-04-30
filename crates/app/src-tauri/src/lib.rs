@@ -81,6 +81,7 @@ pub fn run() {
             host_session::host_start,
             host_session::host_stop,
             host_session::host_status,
+            host_session::host_peer,
             client_session::client_connect,
             client_session::client_disconnect,
             client_session::client_status,

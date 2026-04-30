@@ -126,7 +126,7 @@ fn main() -> Result<()> {
             // upstream callers (or future callers using this same
             // pattern) can flip it externally.
             let shutdown = Arc::new(AtomicBool::new(false));
-            runner::run_stream_blocking(cfg, rect, shutdown, true)
+            runner::run_stream_blocking(cfg, rect, shutdown, true, None)
         }
         Mode::ListAudioSessions => unreachable!("handled above before config load"),
     }

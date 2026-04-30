@@ -25,7 +25,7 @@ use crate::audio;
 use crate::capture::{CaptureError, CaptureRect, Capturer};
 use crate::config::Config;
 use crate::encode::VideoEncoder;
-use crate::transport::{self, run_host_socket, VIDEO_SEND_CHANNEL};
+use crate::transport::{self, run_host_socket, PeerObserver, VIDEO_SEND_CHANNEL};
 use crate::upnp::UpnpForward;
 use crate::vigem::VirtualGamepad;
 
@@ -47,6 +47,12 @@ const FEC_PARITY_RATIO: f32 = 0.10;
 ///
 /// Blocks the calling thread for the lifetime of the stream. Returns
 /// once all worker threads have joined.
+///
+/// `peer_observer`, when supplied, is called from inside the recv loop
+/// each time the bound peer changes (`Some(addr)` on first packet or
+/// reconnect, `None` once at session end). The Tauri shell uses this
+/// to forward `host:peer` events to the frontend; the binary entry
+/// point passes `None` and just logs via the existing trace event.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 // owns inputs for the runtime lifetime; single coherent setup block
 pub fn run_stream_blocking(
@@ -54,6 +60,7 @@ pub fn run_stream_blocking(
     rect: CaptureRect,
     shutdown: Arc<AtomicBool>,
     handle_ctrl_c: bool,
+    peer_observer: Option<PeerObserver>,
 ) -> Result<()> {
     // UPnP guard outlives the runtime; Drop unmaps the port forward.
     let _upnp_guard = if cfg.network.enable_upnp {
@@ -80,8 +87,17 @@ pub fn run_stream_blocking(
         // stall the queue if NVENC briefly overshoots.
         let pacer_bps = (u64::from(cfg.encode.bitrate_kbps) * 1000 / 8) * 5 / 4;
 
+        let peer_observer_for_socket = peer_observer.clone();
         let host_sock = tokio::spawn(async move {
-            match run_host_socket(listen_port, datagram_rx, inbound_tx, pacer_bps).await {
+            match run_host_socket(
+                listen_port,
+                datagram_rx,
+                inbound_tx,
+                pacer_bps,
+                peer_observer_for_socket,
+            )
+            .await
+            {
                 Ok(stats) => tracing::info!(?stats, "host socket stopped"),
                 Err(e) => tracing::error!(error = %e, "host socket failed"),
             }

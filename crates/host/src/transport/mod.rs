@@ -97,15 +97,27 @@ fn bind_listen_socket(listen_port: u16) -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(std_socket)
 }
 
+/// Type alias for the optional peer-change observer. Invoked with
+/// `Some(addr)` when the host first sees a peer (or the peer rotates
+/// to a new ephemeral port), and with `None` once at the end of the
+/// session so observers can clear any "currently connected" UI.
+pub type PeerObserver = Arc<dyn Fn(Option<SocketAddr>) + Send + Sync>;
+
 /// Drives the unified host socket: binds `listen_port`, runs an inbound
 /// dispatcher (input/control), runs the paced video send loop targeting
 /// the most-recently-seen client address. Returns when either the
 /// `datagram_rx` closes (encoder shut down) or `inbound_tx` closes.
+///
+/// `peer_observer`, when supplied, is called from inside the recv loop
+/// each time the bound peer changes — including a final `None` at
+/// session end so the caller (e.g. the Tauri shell) can drop any
+/// "connected client" indicator.
 pub async fn run_host_socket(
     listen_port: u16,
     datagram_rx: mpsc::Receiver<VideoDatagram>,
     inbound_tx: mpsc::Sender<InboundFromClient>,
     target_bps: u64,
+    peer_observer: Option<PeerObserver>,
 ) -> std::io::Result<TransportStats> {
     let socket = Arc::new(bind_listen_socket(listen_port)?);
     let (peer_tx, peer_rx) = watch::channel::<Option<SocketAddr>>(None);
@@ -117,7 +129,12 @@ pub async fn run_host_socket(
     );
 
     let recv_socket = socket.clone();
-    let recv_handle = tokio::spawn(run_recv_loop(recv_socket, peer_tx, inbound_tx));
+    let recv_handle = tokio::spawn(run_recv_loop(
+        recv_socket,
+        peer_tx,
+        inbound_tx,
+        peer_observer,
+    ));
 
     let send_handle = tokio::spawn(run_send_loop(socket, peer_rx, datagram_rx, target_bps));
 
@@ -151,12 +168,43 @@ async fn run_recv_loop(
     socket: Arc<UdpSocket>,
     peer_tx: watch::Sender<Option<SocketAddr>>,
     inbound_tx: mpsc::Sender<InboundFromClient>,
+    peer_observer: Option<PeerObserver>,
 ) -> std::io::Result<TransportStats> {
     let mut stats = TransportStats::default();
     let mut buf = [0u8; 64];
     let mut last_peer: Option<SocketAddr> = None;
+    let result = run_recv_loop_inner(
+        &socket,
+        &peer_tx,
+        &inbound_tx,
+        peer_observer.as_ref(),
+        &mut stats,
+        &mut buf,
+        &mut last_peer,
+    )
+    .await;
+    // Final notification: tell the observer the peer is going away so
+    // any "connected client" UI can clear. This runs whether the loop
+    // exited cleanly or via error.
+    if let Some(obs) = peer_observer.as_ref() {
+        obs(None);
+    }
+    result?;
+    Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)] // tight inner helper, lifetimes outweigh struct churn
+async fn run_recv_loop_inner(
+    socket: &Arc<UdpSocket>,
+    peer_tx: &watch::Sender<Option<SocketAddr>>,
+    inbound_tx: &mpsc::Sender<InboundFromClient>,
+    peer_observer: Option<&PeerObserver>,
+    stats: &mut TransportStats,
+    buf: &mut [u8; 64],
+    last_peer: &mut Option<SocketAddr>,
+) -> std::io::Result<()> {
     loop {
-        let (len, src) = match socket.recv_from(&mut buf).await {
+        let (len, src) = match socket.recv_from(buf).await {
             Ok(v) => v,
             Err(e) => {
                 stats.recv_errors += 1;
@@ -169,11 +217,14 @@ async fn run_recv_loop(
 
         // Track peer changes: usually one client per host, but if the
         // client reconnects from a new ephemeral port we should switch.
-        if last_peer != Some(src) {
+        if *last_peer != Some(src) {
             tracing::info!(peer = %src, "client peer registered");
-            last_peer = Some(src);
+            *last_peer = Some(src);
             // Best-effort: if no receivers, nothing to do.
             let _ = peer_tx.send(Some(src));
+            if let Some(obs) = peer_observer {
+                obs(Some(src));
+            }
         }
 
         let datagram = &buf[..len];
@@ -198,7 +249,7 @@ async fn run_recv_loop(
             }
         }
     }
-    Ok(stats)
+    Ok(())
 }
 
 async fn run_send_loop(
