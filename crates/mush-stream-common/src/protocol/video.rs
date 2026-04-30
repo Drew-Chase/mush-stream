@@ -51,6 +51,15 @@ pub const FLAG_LAST_IN_FRAME: u8 = 1 << 1;
 /// `flags` bit: this is a parity (FEC) packet, not a data packet.
 /// `packet_index` is in `[0, parity_count)` rather than `[0, packet_count)`.
 pub const FLAG_IS_PARITY: u8 = 1 << 2;
+/// `flags` bit: this packet carries audio (Opus) rather than video. The
+/// rest of the header layout is reused with reinterpreted semantics:
+/// `frame_id` is the audio sequence number, `packet_index` and
+/// `packet_count` are 0/1 (audio is always single-packet), `parity_count`
+/// is 0, `last_data_size` is the Opus payload's actual byte length, and
+/// `timestamp_us` is the capture timestamp on the host. Receivers
+/// dispatch on this bit BEFORE handing the datagram to the video
+/// reassembler.
+pub const FLAG_IS_AUDIO: u8 = 1 << 3;
 
 /// Decoded video packet header, host-side representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +88,9 @@ impl VideoPacketHeader {
     }
     pub fn is_parity(&self) -> bool {
         self.flags & FLAG_IS_PARITY != 0
+    }
+    pub fn is_audio(&self) -> bool {
+        self.flags & FLAG_IS_AUDIO != 0
     }
 
     /// Serialize the header into the first `HEADER_SIZE` bytes of `out`.
@@ -432,6 +444,12 @@ impl VideoReassembler {
             });
         }
         let header = VideoPacketHeader::read_from(datagram)?;
+        // Audio packets share the header layout but go to a different
+        // pipeline; ignore here so a misrouted audio datagram doesn't
+        // create bogus video reassembly state.
+        if header.is_audio() {
+            return Ok(None);
+        }
         if header.packet_count == 0 {
             return Err(ProtocolError::ZeroPacketCount);
         }

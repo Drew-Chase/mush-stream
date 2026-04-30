@@ -6,6 +6,7 @@
 //! - client→host: 16-byte input packets and 1-byte control messages,
 //!   disambiguated by datagram size.
 
+pub mod audio;
 pub mod control;
 pub mod error;
 pub mod input;
