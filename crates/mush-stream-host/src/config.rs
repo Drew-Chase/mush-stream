@@ -58,8 +58,9 @@ pub struct AudioConfig {
     /// enumerates audio sessions on the default render device, captures
     /// each non-blacklisted session via WASAPI process loopback, and
     /// mixes them. Common entries: "discord.exe", "chrome.exe",
-    /// "firefox.exe".
-    #[serde(default)]
+    /// "firefox.exe". Default ships with "discord.exe" so voice-chat
+    /// audio doesn't get re-streamed to the remote viewer.
+    #[serde(default = "default_blacklist")]
     pub blacklist: Vec<String>,
 }
 
@@ -68,7 +69,7 @@ impl Default for AudioConfig {
         Self {
             enabled: default_true(),
             bitrate_kbps: default_audio_bitrate(),
-            blacklist: Vec::new(),
+            blacklist: default_blacklist(),
         }
     }
 }
@@ -79,6 +80,10 @@ fn default_true() -> bool {
 
 fn default_audio_bitrate() -> u32 {
     96
+}
+
+fn default_blacklist() -> Vec<String> {
+    vec!["discord.exe".to_owned()]
 }
 
 #[derive(Debug, Error)]
