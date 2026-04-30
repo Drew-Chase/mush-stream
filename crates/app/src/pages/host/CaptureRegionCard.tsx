@@ -126,8 +126,32 @@ export default function CaptureRegionCard({
     const dy = e.clientY - drag.startClientY;
     const sx = drag.monitorW / drag.pvRect.width;
     const sy = drag.monitorH / drag.pvRect.height;
-    const dxM = Math.round(dx * sx);
-    const dyM = Math.round(dy * sy);
+    let dxM = Math.round(dx * sx);
+    let dyM = Math.round(dy * sy);
+
+    // Shift held on a corner handle: lock to the aspect ratio captured
+    // at drag start so the marquee scales diagonally. Pick whichever
+    // axis the user pushed harder (in aspect-corrected terms) as the
+    // dominant one, then derive the other from it.
+    const isCorner =
+      drag.mode === "nw" ||
+      drag.mode === "ne" ||
+      drag.mode === "sw" ||
+      drag.mode === "se";
+    if (e.shiftKey && isCorner && drag.startCapture.height > 0) {
+      const aspect = drag.startCapture.width / drag.startCapture.height;
+      // Sign convention: +dxM grows width on east-anchored corners,
+      // shrinks it on west-anchored corners (and same for dyM/south).
+      const wDir = drag.mode === "ne" || drag.mode === "se" ? 1 : -1;
+      const hDir = drag.mode === "sw" || drag.mode === "se" ? 1 : -1;
+      const dW = wDir * dxM;
+      const dH = hDir * dyM;
+      if (Math.abs(dW) > Math.abs(dH * aspect)) {
+        dyM = hDir * Math.round(dW / aspect);
+      } else {
+        dxM = wDir * Math.round(dH * aspect);
+      }
+    }
 
     let { x, y, width, height } = drag.startCapture;
     switch (drag.mode) {
