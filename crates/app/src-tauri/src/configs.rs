@@ -91,8 +91,14 @@ pub fn default_client_config() -> ClientConfig {
                 .expect("hardcoded default address parses"),
         },
         display: DisplayConfig {
-            width: 2560,
-            height: 1440,
+            // Default to 720p so a fresh install opens to a normal-
+            // sized window even when the host is streaming at 1440p
+            // or higher. The display layer downscales the source via
+            // `pixels`'s `ScalingMode::Fill`, preserving aspect with
+            // black letterbox / pillarbox margins. Users with bigger
+            // monitors can resize the window or edit `client.toml`.
+            width: 1280,
+            height: 720,
             title: "Mush Stream".to_string(),
             fullscreen: false,
         },

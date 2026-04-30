@@ -1,9 +1,12 @@
 //! H.264 decoding via `ffmpeg-the-third`.
 //!
 //! Tries `h264_cuvid` (NVIDIA hardware decode) first when configured, falls
-//! back to the bundled software h264 decoder. Output is upscaled / colour-
-//! converted to packed RGBA via libswscale so the display layer can blit
-//! straight into a `pixels` framebuffer without per-pixel work.
+//! back to the bundled software h264 decoder. Output is colour-converted
+//! to packed RGBA via libswscale at the *source* resolution — no scaling
+//! happens here. Window fitting (and the corresponding letterbox /
+//! pillarbox) is the display layer's job, since it's the only side that
+//! knows the current window size and can preserve aspect ratio across
+//! resizes.
 
 use ffmpeg_the_third as ffmpeg;
 use ffmpeg::{
@@ -70,18 +73,17 @@ impl std::fmt::Debug for DecodedFrame {
     }
 }
 
-/// H.264 decoder. Internally lazy: the swscale converter is built on the
-/// first decoded frame because the stream's actual width/height/pixel format
-/// aren't known until the first IDR is decoded.
+/// H.264 decoder. Internally lazy: the swscale converter and its
+/// destination frame are built on the first decoded frame because the
+/// stream's actual width/height/pixel format aren't known until the
+/// first IDR is decoded.
 pub struct VideoDecoder {
     decoder: codec::decoder::Video,
     scaler: Option<scaling::Context>,
-    /// Display target size; swscale will scale-and-convert decoded frames
-    /// to fit. Set from client config.
-    dst_width: u32,
-    dst_height: u32,
-    /// Reusable destination frame for swscale output.
-    rgba_frame: frame::Video,
+    /// Reusable destination frame for swscale output. `None` until the
+    /// first frame arrives; thereafter sized to the source's dimensions
+    /// and re-allocated only if the source resolution changes.
+    rgba_frame: Option<frame::Video>,
     /// Accelerator name actually opened (e.g. "h264_cuvid" or "h264").
     backend: &'static str,
 }
@@ -89,11 +91,7 @@ pub struct VideoDecoder {
 impl VideoDecoder {
     /// Try to open `h264_cuvid` if `prefer_hardware`, otherwise (or on
     /// failure) the software h264 decoder.
-    pub fn new(
-        prefer_hardware: bool,
-        dst_width: u32,
-        dst_height: u32,
-    ) -> Result<Self, DecodeError> {
+    pub fn new(prefer_hardware: bool) -> Result<Self, DecodeError> {
         ffmpeg::init().map_err(DecodeError::Init)?;
 
         // Build the open-decoder candidates list, hardware first when asked.
@@ -116,13 +114,10 @@ impl VideoDecoder {
             {
                 Ok(decoder) => {
                     tracing::info!(backend = name, "video decoder opened");
-                    let rgba_frame = frame::Video::new(Pixel::RGBA, dst_width, dst_height);
                     return Ok(Self {
                         decoder,
                         scaler: None,
-                        dst_width,
-                        dst_height,
-                        rgba_frame,
+                        rgba_frame: None,
                         backend: name,
                     });
                 }
@@ -197,10 +192,10 @@ impl VideoDecoder {
         loop {
             match self.decoder.receive_frame(&mut decoded) {
                 Ok(()) => {
-                    let rgba = self.scale_to_rgba(&decoded)?;
+                    let (width, height, rgba) = self.scale_to_rgba(&decoded)?;
                     on_frame(DecodedFrame {
-                        width: self.dst_width,
-                        height: self.dst_height,
+                        width,
+                        height,
                         rgba,
                         first_packet_instant,
                         encoded_bytes,
@@ -220,13 +215,22 @@ impl VideoDecoder {
         Ok(())
     }
 
-    fn scale_to_rgba(&mut self, decoded: &frame::Video) -> Result<Vec<u8>, DecodeError> {
+    /// Convert the decoded frame to packed RGBA at the *source*
+    /// resolution. Returns `(width, height, rgba)` so the display
+    /// layer can size its framebuffer to the source's aspect ratio.
+    fn scale_to_rgba(
+        &mut self,
+        decoded: &frame::Video,
+    ) -> Result<(u32, u32, Vec<u8>), DecodeError> {
         let src_format = decoded.format();
         let src_width = decoded.width();
         let src_height = decoded.height();
 
-        // (Re)build the scaler if the stream's source params changed (or
-        // it's the first frame).
+        // (Re)build the scaler + destination frame if the stream's
+        // source params changed (or it's the first frame). We scale to
+        // the same dimensions — swscale here is just doing the colour
+        // conversion (typically YUV → RGBA); resizing is the display
+        // layer's responsibility.
         let needs_rebuild = self.scaler.as_ref().is_none_or(|s| {
             s.input().format != src_format
                 || s.input().width != src_width
@@ -239,37 +243,39 @@ impl VideoDecoder {
                     src_width,
                     src_height,
                     Pixel::RGBA,
-                    self.dst_width,
-                    self.dst_height,
+                    src_width,
+                    src_height,
                     scaling::Flags::BILINEAR,
                 )
                 .ff("scaling::Context::get")?,
             );
+            self.rgba_frame =
+                Some(frame::Video::new(Pixel::RGBA, src_width, src_height));
             tracing::debug!(
                 src_w = src_width,
                 src_h = src_height,
                 ?src_format,
-                dst_w = self.dst_width,
-                dst_h = self.dst_height,
-                "swscale (re)initialized"
+                "swscale (re)initialized at source resolution"
             );
         }
         let scaler = self.scaler.as_mut().expect("scaler must be Some");
-        scaler
-            .run(decoded, &mut self.rgba_frame)
-            .ff("scaling run")?;
+        let rgba_frame = self
+            .rgba_frame
+            .as_mut()
+            .expect("rgba_frame must be Some after rebuild");
+        scaler.run(decoded, rgba_frame).ff("scaling run")?;
 
         // Pack the destination RGBA into a tightly-packed Vec, stripping
         // any line-pitch padding swscale may have emitted.
-        let stride = self.rgba_frame.stride(0);
-        let row_bytes = (self.dst_width as usize) * 4;
-        let height = self.dst_height as usize;
+        let stride = rgba_frame.stride(0);
+        let row_bytes = (src_width as usize) * 4;
+        let height = src_height as usize;
         let mut out = Vec::with_capacity(row_bytes * height);
-        let src = self.rgba_frame.data(0);
+        let src = rgba_frame.data(0);
         for row in 0..height {
             let off = row * stride;
             out.extend_from_slice(&src[off..off + row_bytes]);
         }
-        Ok(out)
+        Ok((src_width, src_height, out))
     }
 }

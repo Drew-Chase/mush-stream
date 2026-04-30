@@ -100,7 +100,7 @@ fn probe_nvenc() -> ProbeRow {
 /// `h264` for software fallback).
 fn probe_nvdec() -> ProbeRow {
     use mush_stream_client::decode::VideoDecoder;
-    match VideoDecoder::new(true, 640, 360) {
+    match VideoDecoder::new(true) {
         Ok(d) => {
             let backend = d.backend();
             let status = if backend.contains("cuvid") {

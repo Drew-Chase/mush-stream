@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use font8x8::UnicodeFonts;
-use pixels::{wgpu::PresentMode, Pixels, PixelsBuilder, SurfaceTexture};
+use pixels::{
+    wgpu::{Color, PresentMode},
+    Pixels, PixelsBuilder, ScalingMode, SurfaceTexture,
+};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -119,6 +122,11 @@ pub struct DisplayApp {
     config: DisplayConfig,
     window: Option<&'static Window>,
     pixels: Option<Pixels<'static>>,
+    /// Current framebuffer dimensions. Starts at the configured
+    /// window size; replaced with the source's true dimensions on the
+    /// first decoded frame so `pixels`'s aspect-preserving scaler can
+    /// letterbox / pillarbox correctly when the window is resized.
+    buffer_size: (u32, u32),
     last_frame: Option<DecodedFrame>,
     /// Cumulative present stats; observers can read this after exit.
     pub stats: PresentStats,
@@ -137,10 +145,12 @@ pub struct DisplayApp {
 
 impl DisplayApp {
     pub fn new(config: DisplayConfig) -> Self {
+        let buffer_size = (config.width, config.height);
         Self {
             config,
             window: None,
             pixels: None,
+            buffer_size,
             last_frame: None,
             stats: PresentStats {
                 cumulative_min_us: u64::MAX,
@@ -192,9 +202,23 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
         let pixels_result =
             PixelsBuilder::new(self.config.width, self.config.height, surface)
                 .present_mode(PresentMode::Mailbox)
+                // Explicit black margins. With `ScalingMode::Fill`
+                // (set below), `pixels` does fractional aspect-
+                // preserving fit; when the window's aspect differs
+                // from the framebuffer's, the surface clear shows
+                // through as letterbox / pillarbox.
+                .clear_color(Color::BLACK)
                 .build();
         match pixels_result {
-            Ok(pixels) => {
+            Ok(mut pixels) => {
+                // Fractional fit, not pixel-perfect integer scaling.
+                // The default `PixelPerfect` mode caps scale at
+                // floor(min) ≥ 1.0 — so a 2560×1440 framebuffer in a
+                // 1280×720 window would render at 1.0× and clip. Using
+                // `Fill` lets a larger source downscale to fit the
+                // window while preserving aspect, with margins filled
+                // by the clear colour above.
+                pixels.set_scaling_mode(ScalingMode::Fill);
                 self.pixels = Some(pixels);
                 self.window = Some(window);
                 tracing::info!(
@@ -281,6 +305,34 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Frame(frame) => {
+                // If the source resolution doesn't match our current
+                // framebuffer (first frame, or the host changed its
+                // capture rect mid-session), resize the pixels buffer
+                // so its aspect ratio matches the source. The built-in
+                // ScalingRenderer then letterboxes / pillarboxes inside
+                // the window — content is contained, never cropped.
+                if (frame.width, frame.height) != self.buffer_size
+                    && let Some(pixels) = self.pixels.as_mut()
+                {
+                    if let Err(e) = pixels.resize_buffer(frame.width, frame.height)
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            new_w = frame.width,
+                            new_h = frame.height,
+                            "pixels.resize_buffer failed; keeping previous size",
+                        );
+                    } else {
+                        tracing::info!(
+                            old = ?self.buffer_size,
+                            new_w = frame.width,
+                            new_h = frame.height,
+                            "framebuffer resized to source dimensions",
+                        );
+                        self.buffer_size = (frame.width, frame.height);
+                    }
+                }
+
                 // Track recent encoded sizes for the bitrate readout.
                 let now = Instant::now();
                 self.bitrate_window.push_back((now, frame.encoded_bytes));
@@ -318,11 +370,15 @@ impl DisplayApp {
 
         if self.show_debug {
             // Render text directly into the pixels framebuffer before
-            // pixels.render() copies it to the GPU.
+            // pixels.render() copies it to the GPU. Use the *current*
+            // buffer dims (which track the source) — `config.width/
+            // height` was just the initial window size and may not
+            // match the framebuffer once the source is known.
+            let (buf_w, buf_h) = self.buffer_size;
             render_overlay(
                 dst,
-                self.config.width,
-                self.config.height,
+                buf_w,
+                buf_h,
                 &OverlayState {
                     backend: self.backend,
                     frames_presented: self.stats.frames_presented + 1, // about to present

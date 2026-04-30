@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use winit::event_loop::EventLoopProxy;
 
 use crate::audio;
-use crate::config::{Config, DecodeConfig, DisplayConfig};
+use crate::config::{Config, DecodeConfig};
 use crate::decode::VideoDecoder;
 use crate::display::{self, DisplayApp, UserEvent};
 use crate::input::{run_gamepad_loop, InputCommand};
@@ -145,16 +145,10 @@ fn run_session(
     // Decode thread.
     let proxy_for_decode = proxy.clone();
     let decode_cfg = cfg.decode.clone();
-    let display_cfg_for_decode = cfg.display.clone();
     let decode_thread = std::thread::Builder::new()
         .name("mush-decode".into())
         .spawn(move || {
-            if let Err(e) = run_decode_loop(
-                decode_cfg,
-                display_cfg_for_decode,
-                frame_rx,
-                proxy_for_decode,
-            ) {
+            if let Err(e) = run_decode_loop(decode_cfg, frame_rx, proxy_for_decode) {
                 tracing::error!(error = %e, "decode loop exited with error");
             }
         })
@@ -246,16 +240,11 @@ fn run_session(
 #[allow(clippy::needless_pass_by_value)] // long-running thread entry; owns its inputs
 fn run_decode_loop(
     decode_cfg: DecodeConfig,
-    display_cfg: DisplayConfig,
     mut frame_rx: tokio::sync::mpsc::Receiver<DeliveredFrame>,
     proxy: EventLoopProxy<UserEvent>,
 ) -> Result<()> {
-    let mut decoder = VideoDecoder::new(
-        decode_cfg.prefer_hardware,
-        display_cfg.width,
-        display_cfg.height,
-    )
-    .context("initializing video decoder")?;
+    let mut decoder = VideoDecoder::new(decode_cfg.prefer_hardware)
+        .context("initializing video decoder")?;
     let backend = decoder.backend();
     tracing::info!(backend, "decoder ready");
 
