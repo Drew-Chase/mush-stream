@@ -267,10 +267,12 @@ pub fn run_capture_encode_loop(
                     encoder.request_keyframe();
                     keyframes_forced += 1;
                 }
-                ControlMessage::Disconnect => {
-                    tracing::info!("client requested disconnect; encode loop exiting");
-                    shutdown.store(true, Ordering::Release);
-                }
+                // `Disconnect` is intercepted at the transport layer
+                // (clears the bound peer without killing the session)
+                // and never reaches this channel. Match it here only
+                // for exhaustiveness — treat as a no-op if a future
+                // refactor reroutes the message.
+                ControlMessage::Disconnect => {}
             }
         }
 

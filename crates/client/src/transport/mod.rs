@@ -47,6 +47,28 @@ pub const UDP_RECV_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// interval is enough to ask the encoder for an IDR.
 const KEYFRAME_REQUEST_DEBOUNCE: Duration = Duration::from_millis(200);
 
+/// Treat the host as gone if we receive zero packets for this long. At
+/// any reasonable framerate the host is sending well under one frame
+/// interval between packets, so a 5-second silence is unambiguous: the
+/// host has stopped broadcasting (user clicked Stop, process died,
+/// route became unreachable). The receiver returns
+/// [`ReceiverExit::HostSilent`] so the runner can drive a reconnect
+/// loop without tearing down the display window.
+const HOST_SILENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why `run_video_receiver` returned. The runner uses this to decide
+/// between "wait and try to reconnect" and "fall through to shutdown".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverExit {
+    /// The downstream channel (decode thread) closed; the runner is
+    /// shutting down — no reconnect.
+    DownstreamClosed,
+    /// We didn't see a packet from the host for [`HOST_SILENCE_TIMEOUT`].
+    /// The runner should treat this as a transient host outage and
+    /// retry the connection.
+    HostSilent,
+}
+
 /// A reassembled frame plus the local `Instant` at which its *first*
 /// packet arrived. The display layer uses this `Instant` to compute the
 /// network-arrival → present lag without needing synchronized clocks.
@@ -123,7 +145,7 @@ pub async fn run_video_receiver(
     out: mpsc::Sender<DeliveredFrame>,
     request_keyframe_send: Option<mpsc::Sender<crate::input::InputCommand>>,
     audio_out: Option<mpsc::Sender<AudioPacket>>,
-) -> std::io::Result<ReceiverStats> {
+) -> std::io::Result<(ReceiverExit, ReceiverStats)> {
     use crate::input::InputCommand;
 
     let mut reasm = VideoReassembler::new(REASM_MAX_PENDING);
@@ -161,12 +183,25 @@ pub async fn run_video_receiver(
     };
 
     loop {
-        let len = match socket.recv(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
+        let len = match tokio::time::timeout(
+            HOST_SILENCE_TIMEOUT,
+            socket.recv(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 stats.recv_errors += 1;
                 tracing::warn!(error = %e, "recv failed");
                 continue;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_secs = HOST_SILENCE_TIMEOUT.as_secs(),
+                    "no packets from host within silence threshold; \
+                     treating host as gone"
+                );
+                return Ok((ReceiverExit::HostSilent, stats));
             }
         };
         stats.packets_received += 1;
@@ -278,7 +313,10 @@ pub async fn run_video_receiver(
             });
         }
     }
-    Ok(stats)
+    // Loop exit via `break` only happens on a closed `out` channel,
+    // i.e. the decoder is gone — runner is shutting the whole client
+    // down, no reconnect.
+    Ok((ReceiverExit::DownstreamClosed, stats))
 }
 
 /// Send loop: drains an `InputCommand` channel and sends each command on

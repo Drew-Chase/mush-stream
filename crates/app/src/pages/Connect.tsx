@@ -33,6 +33,9 @@ export default function Connect() {
       />
     );
   }
+  if (clientState === "reconnecting") {
+    return <ReconnectingScreen addr={clientAddress ?? prefill} />;
+  }
   if (clientState === "connected") {
     return <ConnectedScreen addr={clientAddress ?? prefill} />;
   }
@@ -366,6 +369,55 @@ function ConnectingScreen({
             }}
           >
             <Btn onClick={() => clientDisconnect()}>Cancel</Btn>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Shown while the runner is in its retry-after-silence loop. The
+ * native client window is still open behind the scenes — the
+ * decoder + display are paused on an empty frame channel, ready to
+ * resume the moment the host comes back. The user can bail out via
+ * the Disconnect button, which flips the runner's shutdown atomic
+ * and breaks the retry loop.
+ */
+function ReconnectingScreen({ addr }: { addr: string }) {
+  // Tick a per-second elapsed counter so the user can see progress
+  // rather than a frozen banner. The runner sleeps RECONNECT_DELAY
+  // (5 s) between attempts, so the counter resets implicitly when
+  // we transition back to `connected`.
+  const [secondsAgo, setSecondsAgo] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setSecondsAgo((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <div className="screen">
+      <div className="conn">
+        <Card>
+          <div className="connecting">
+            <div className="connecting__spin" />
+            <div className="connecting__msg">
+              Reconnecting to <span className="mono">{addr}</span>
+            </div>
+            <div className="connecting__sub">
+              Host went silent {secondsAgo}s ago — retrying every 5s.
+              The native viewer stays open and will resume in place.
+            </div>
+          </div>
+          <div
+            style={{
+              padding: 16,
+              borderTop: "1px solid var(--line-soft)",
+              display: "flex",
+              justifyContent: "flex-end",
+            }}
+          >
+            <Btn onClick={() => clientDisconnect()}>Disconnect</Btn>
           </div>
         </Card>
       </div>

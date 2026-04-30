@@ -238,6 +238,22 @@ async fn run_recv_loop_inner(
             other => Err(format!("unexpected datagram size {other}")),
         };
         match parsed {
+            // Disconnect is handled at the transport layer rather than
+            // forwarded to the encode loop: the client is telling us it's
+            // going away, so we clear the bound peer (so the send loop
+            // stops shovelling video at a dead socket) and notify the
+            // peer observer so the host UI clears its "connected client"
+            // indicator. We do *not* stop encoding — the host stays
+            // broadcasting, ready for the same client to reconnect or a
+            // different client to take over.
+            Ok(InboundFromClient::Control(ControlMessage::Disconnect)) => {
+                tracing::info!(peer = %src, "client signaled disconnect");
+                *last_peer = None;
+                let _ = peer_tx.send(None);
+                if let Some(obs) = peer_observer {
+                    obs(None);
+                }
+            }
             Ok(msg) => {
                 if inbound_tx.send(msg).await.is_err() {
                     break;

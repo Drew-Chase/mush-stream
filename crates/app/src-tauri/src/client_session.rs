@@ -9,10 +9,14 @@
 //! the same process as the Tauri webview — so the app ships as one
 //! executable.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use mush_stream_client::runner::{self, ClientSessionHandle, ShutdownHandle};
+use mush_stream_client::runner::{
+    self, ClientSessionHandle, SessionEvent, SessionEventCallback, ShutdownHandle,
+};
 
 use crate::configs::{self, ClientConfig};
 use crate::state::AppState;
@@ -24,6 +28,12 @@ pub enum ClientState {
     Idle,
     Connecting,
     Connected,
+    /// We were connected, the host went silent (or the initial
+    /// connect failed), and the runner is sleeping before its next
+    /// retry. The frontend renders a "Reconnecting…" banner; the
+    /// display window stays open so the user doesn't lose their
+    /// place.
+    Reconnecting,
     Disconnected,
     Error,
 }
@@ -95,8 +105,37 @@ pub async fn client_connect(
         None,
     );
 
+    // Build the lifecycle observer the runner pings on
+    // Connecting/Connected/Reconnecting/Disconnected. We forward each
+    // mapped state to the frontend via the existing `client:state`
+    // event so the React UI can render a "reconnecting…" banner
+    // without inventing a parallel channel.
+    let app_for_events = app.clone();
+    let address_for_events = options.address.clone();
+    let session_callback: SessionEventCallback =
+        Arc::new(move |ev: SessionEvent| {
+            // Skip the runner's terminal `Disconnected` — the
+            // watchdog below emits the authoritative final state
+            // (Disconnected vs Error) once the runner thread has
+            // actually joined, and we don't want to race that.
+            let mapped = match ev {
+                SessionEvent::Connecting => ClientState::Connecting,
+                SessionEvent::Connected => ClientState::Connected,
+                SessionEvent::Reconnecting => ClientState::Reconnecting,
+                SessionEvent::Disconnected => return,
+            };
+            let _ = app_for_events.emit(
+                "client:state",
+                ClientStateEvent {
+                    state: mapped,
+                    address: Some(address_for_events.clone()),
+                    error: None,
+                },
+            );
+        });
+
     let handle: ClientSessionHandle =
-        runner::start_client_session(cfg).map_err(|e| {
+        runner::start_client_session(cfg, Some(session_callback)).map_err(|e| {
             let msg = format!("starting client session: {e}");
             emit_state(&app, ClientState::Error, Some(options.address.clone()), Some(msg.clone()));
             msg
@@ -115,17 +154,10 @@ pub async fn client_connect(
         });
     }
 
-    // The runner doesn't surface a "connected" milestone of its own
-    // (winit doesn't send one, and the first frame may take ~280 ms
-    // after handshake). We optimistically flip to Connected as soon
-    // as the runner has spawned; the watchdog below catches the
-    // disconnect/error transitions when the thread returns.
-    emit_state(
-        &app,
-        ClientState::Connected,
-        Some(options.address.clone()),
-        None,
-    );
+    // No optimistic "Connected" emit here: the runner pings the
+    // session callback with `SessionEvent::Connected` once its UDP
+    // socket actually comes up, and the watchdog below emits the
+    // authoritative final state when the thread returns.
 
     // Watchdog: when the runner thread finishes (window closed by
     // user OR shutdown signaled by us), emit the appropriate state

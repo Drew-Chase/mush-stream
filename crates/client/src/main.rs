@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     // through the same path the Tauri shell uses; the dedicated runner
     // thread (with `with_any_thread(true)` on Windows) means the main
     // thread is free of winit's traditional "main-thread-only" rule.
-    let session = runner::start_client_session(cfg)?;
+    let session = runner::start_client_session(cfg, None)?;
     session.join()?;
     tracing::info!("client exiting");
     Ok(())

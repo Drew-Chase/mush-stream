@@ -211,6 +211,11 @@ export type ClientState =
   | "idle"
   | "connecting"
   | "connected"
+  /** Previously connected; the host went silent (or the initial
+   *  connect failed) and the runner is sleeping before its next
+   *  retry. The native client window stays open so the session can
+   *  resume in place once the host returns. */
+  | "reconnecting"
   | "disconnected"
   | "error";
 
