@@ -186,15 +186,3 @@ pub async fn logs_buffer(
     Ok(state.snapshot())
 }
 
-/// Forward a single externally-sourced log line into the sink.
-/// Used by `client_session` / `host_session` to surface lines coming
-/// off a spawned binary's stdout.
-pub fn ingest_external(sink: &LogSink, level: &str, target: &str, message: String) {
-    let now: DateTime<Utc> = Utc::now();
-    sink.push(LogLine {
-        ts: now.to_rfc3339(),
-        level: level.to_string(),
-        target: target.to_string(),
-        message,
-    });
-}

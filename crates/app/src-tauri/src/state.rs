@@ -12,6 +12,11 @@ use crate::recents::RecentEntry;
 
 /// Filesystem paths derived once at startup.
 pub struct AppPaths {
+    /// Root of the per-user config dir. Not currently read directly —
+    /// every consumer goes through one of the typed paths below — but
+    /// kept for callers that want to write ad-hoc files (e.g. future
+    /// log dumps).
+    #[allow(dead_code)]
     pub config_dir: PathBuf,
     pub host_toml: PathBuf,
     pub client_toml: PathBuf,

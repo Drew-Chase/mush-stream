@@ -3,7 +3,6 @@
 //! the log-emitter task.
 
 mod addresses;
-mod bin_locator;
 mod client_session;
 mod configs;
 mod host_session;

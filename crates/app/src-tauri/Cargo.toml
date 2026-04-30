@@ -40,7 +40,6 @@ windows = { workspace = true, features = ["Win32_System_Registry"] }
 # The mush libraries
 mush-stream-client = { path = "../../client" }
 mush-stream-host = { path = "../../host" }
-mush-stream-common = { path = "../../common" }
 
 [lints]
 workspace = true
