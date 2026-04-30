@@ -1,0 +1,210 @@
+# ---------------------------------------------------------------------------
+# Release pipeline for the Mush Stream Tauri app.
+#
+# Triggered on `v*` tag push (e.g. via `just publish 0.1.1`).
+#
+# Flow:
+#   1. create-release  — opens a draft GitHub release, outputs the
+#                        release_id consumed by the build matrix.
+#   2. build-tauri     — Windows-only build (host crate uses DXGI /
+#                        WASAPI / ViGEmBus, all Windows APIs).
+#                        `tauri-apps/tauri-action` builds the frontend,
+#                        runs `cargo tauri build` with signing keys
+#                        attached, and uploads the NSIS / MSI
+#                        installers + their `.sig` signatures + a
+#                        `latest.json` manifest the in-app updater
+#                        polls. The raw `mush_stream.exe` is
+#                        deliberately NOT uploaded — only the setup
+#                        artifacts.
+#   3. publish-release — flips the draft to public, but only if the
+#                        build matrix succeeded. A failed build leaves
+#                        the draft so you can investigate.
+#
+# Secrets required:
+#   - TAURI_SIGNING_PRIVATE_KEY
+#       Full contents of the private key produced by
+#       `pnpm tauri signer generate -w mush-stream.key`. Used by
+#       tauri-action to sign the updater manifest. The matching
+#       public key is embedded in `tauri.conf.json` →
+#       `plugins.updater.pubkey`.
+#   - TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#       The password chosen during signer-generate.
+#
+# Token used for release upload:
+#   The auto-provisioned `secrets.GITHUB_TOKEN` is enough — the
+#   workflow declares `permissions: contents: write` below, which
+#   grants it the rights needed to create releases and upload
+#   assets in this same repo. No custom PAT secret is needed.
+# ---------------------------------------------------------------------------
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Open a draft release once so the build job has a stable
+  #    release_id to upload to. Doing this in a dedicated job avoids
+  #    races we'd otherwise hit if the matrix were ever expanded to
+  #    multiple platforms.
+  # -------------------------------------------------------------------------
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create draft release
+        id: create
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = context.ref.replace("refs/tags/", "");
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: tag,
+              body: "",
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+          result-encoding: string
+
+  # -------------------------------------------------------------------------
+  # 2. Windows build. Single-platform — DXGI, WASAPI loopback, and
+  #    ViGEmBus are all Windows APIs, so a macOS or Linux runner would
+  #    fail at compile time.
+  # -------------------------------------------------------------------------
+  build-tauri:
+    needs: create-release
+    runs-on: windows-latest
+
+    env:
+      # ffmpeg-the-third 5.0.0+ffmpeg-8.1 looks at FFMPEG_DIR for a
+      # tree containing bin/include/lib. Set in the FFmpeg setup step
+      # below; surfaced here so the cargo build sees it.
+      FFMPEG_DIR: ${{ github.workspace }}/ffmpeg
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Frontend toolchain --------------------------------------------
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+          cache-dependency-path: crates/app/pnpm-lock.yaml
+
+      # ---- Rust toolchain ------------------------------------------------
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cache target/ + ~/.cargo so successive builds don't re-compile
+      # the entire dep tree (notably ffmpeg-sys-the-third, which is
+      # slow). Key scoped to windows-release so it doesn't collide
+      # with potential future Linux/macOS caches.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: windows-release
+
+      # ---- FFmpeg shared dev tree ----------------------------------------
+      # gyan.dev's `ffmpeg-release-full-shared` 7z ships bin/, include/,
+      # and lib/ — exactly the layout ffmpeg-the-third's build script
+      # expects. Resolve to a stable directory so FFMPEG_DIR (set above
+      # via env:) lines up with where we expand the archive.
+      - name: Setup FFmpeg
+        shell: pwsh
+        run: |
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z"
+          $archive = "$env:RUNNER_TEMP\ffmpeg.7z"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          7z x $archive -o"$env:RUNNER_TEMP\ffmpeg-extract" -y | Out-Null
+          # The archive expands to a single versioned folder. Move its
+          # contents to the canonical FFMPEG_DIR location.
+          $inner = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg-extract" -Directory)[0].FullName
+          Move-Item -Path $inner -Destination "$env:GITHUB_WORKSPACE\ffmpeg"
+          Write-Host "FFMPEG_DIR contents:"
+          Get-ChildItem "$env:GITHUB_WORKSPACE\ffmpeg"
+
+      # ---- ViGEmBus installer download -----------------------------------
+      # `bundle.resources` in tauri.conf.json points to a ViGEmBus
+      # installer at the workspace root. The file isn't tracked in
+      # git; pull it from nefarius/ViGEmBus's release assets so the
+      # NSIS installer's POSTINSTALL hook has the driver to launch.
+      - name: Download ViGEmBus installer
+        shell: pwsh
+        run: |
+          $url = "https://github.com/nefarius/ViGEmBus/releases/download/v1.18.367/ViGEmBus_1.18.367_x64_x86.exe"
+          $dest = "$env:GITHUB_WORKSPACE\ViGEmBus_1.18.367_x64_x86.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dest
+          Write-Host "ViGEmBus downloaded to $dest"
+
+      # ---- Frontend deps -------------------------------------------------
+      - name: Install frontend dependencies
+        working-directory: crates/app
+        run: pnpm install --frozen-lockfile
+
+      # ---- Tauri build + upload installers -------------------------------
+      # tauri-action does four things:
+      #   1. Runs `pnpm build` (beforeBuildCommand from tauri.conf.json).
+      #   2. Runs `cargo tauri build --release` with FFMPEG_DIR + the
+      #      signing key passed through env vars below.
+      #   3. Collects every installer artifact under
+      #      target/release/bundle/* (NSIS .exe setup + .exe.sig,
+      #      MSI .msi + .msi.sig).
+      #   4. With `includeUpdaterJson: true`, also produces and uploads
+      #      a `latest.json` updater manifest pointing at those
+      #      installers — that's the file the in-app updater polls.
+      #
+      # Note: we explicitly do NOT add a follow-up "upload raw exe"
+      # step. Only setup-form artifacts are shipped per the design
+      # decision that distribution = installers only.
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          FFMPEG_DIR: ${{ env.FFMPEG_DIR }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          projectPath: crates/app
+          includeUpdaterJson: true
+
+  # -------------------------------------------------------------------------
+  # 3. Publish the release. Only runs if the build succeeded — a
+  #    failure leaves the draft untouched so the tag isn't prematurely
+  #    associated with a broken release.
+  # -------------------------------------------------------------------------
+  publish-release:
+    needs: [create-release, build-tauri]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Flip release to public
+        uses: actions/github-script@v7
+        env:
+          release_id: ${{ needs.create-release.outputs.release_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.release_id),
+              draft: false,
+              prerelease: false,
+            });
