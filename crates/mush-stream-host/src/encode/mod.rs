@@ -93,7 +93,8 @@ impl VideoEncoder {
         let codec = codec::encoder::find_by_name("h264_nvenc")
             .ok_or(EncodeError::NvencNotFound)?;
 
-        let encoder_tb = Rational(1, fps as i32);
+        let fps_i32 = i32::try_from(fps).unwrap_or(i32::MAX);
+        let encoder_tb = Rational(1, fps_i32);
 
         let mut enc_ctx = codec::Context::new_with_codec(codec)
             .encoder()
@@ -102,8 +103,8 @@ impl VideoEncoder {
         enc_ctx.set_width(width);
         enc_ctx.set_height(height);
         enc_ctx.set_time_base(encoder_tb);
-        enc_ctx.set_frame_rate(Some(Rational(fps as i32, 1)));
-        enc_ctx.set_format(Pixel::BGR0);
+        enc_ctx.set_frame_rate(Some(Rational(fps_i32, 1)));
+        enc_ctx.set_format(Pixel::BGRZ);
         enc_ctx.set_bit_rate(bitrate_bps as usize);
         enc_ctx.set_max_bit_rate(bitrate_bps as usize);
         enc_ctx.set_gop(fps); // 1-second keyframe interval
@@ -113,18 +114,38 @@ impl VideoEncoder {
         }
 
         let mut opts = Dictionary::new();
-        opts.set("preset", "p1");
+        // Tuned for "9 Mbps at 60fps shouldn't look like minecraft":
+        // - preset p4 (balanced) instead of p1 (fastest). NVENC on any
+        //   RTX-class card handles 1440p60 at p4 well within frame
+        //   budget. p1 was throwing away too much detail at low bitrates,
+        //   especially in motion.
+        // - tune=ll keeps the low-latency path (no B-frames, no
+        //   reordering). zerolatency=1 also OFF the lookahead.
+        // - rc=cbr with delay=0, rc-lookahead=0, no-scenecut=1 — same
+        //   stream-shape constraints as before.
+        // - multipass=qres adds a quarter-resolution analysis pass for
+        //   smarter QP allocation at modest GPU cost; almost no latency
+        //   impact in practice.
+        // - spatial-aq=1 / aq-strength=8 distribute bits toward visually
+        //   important regions (faces, edges, smooth gradients) — big
+        //   visible quality bump at low bitrates.
+        // - profile=high gives the encoder access to the H.264 features
+        //   that compress efficiently. cuvid + sw h264 both decode high.
+        opts.set("preset", "p4");
         opts.set("tune", "ll");
         opts.set("zerolatency", "1");
-        // M5 tuning: turn off VBV strict for steadier latency.
         opts.set("rc", "cbr");
         opts.set("delay", "0");
         opts.set("rc-lookahead", "0");
         opts.set("no-scenecut", "1");
+        opts.set("multipass", "qres");
+        opts.set("spatial-aq", "1");
+        opts.set("aq-strength", "8");
+        opts.set("profile", "high");
 
         let encoder = enc_ctx.open_with(opts).ff("open_with(NVENC opts)")?;
 
-        let mut frame = frame::Video::new(Pixel::BGR0, width, height);
+        let mut frame = frame::Video::new(Pixel::BGRZ, width, height);
         frame.set_pts(Some(0));
 
         Ok(Self {
@@ -142,10 +163,10 @@ impl VideoEncoder {
         self.encoder_time_base
     }
 
-    /// Mark the next encoded frame as an IDR. The encoder will emit SPS/PPS
-    /// + an I-frame on the very next `push_bgra` regardless of GOP timing.
-    /// Used by M7 to recover from packet loss without waiting for the next
-    /// scheduled keyframe.
+    /// Mark the next encoded frame as an IDR. The encoder will emit
+    /// SPS/PPS plus an I-frame on the very next `push_bgra` regardless
+    /// of GOP timing. Used by M7 to recover from packet loss without
+    /// waiting for the next scheduled keyframe.
     pub fn request_keyframe(&mut self) {
         self.force_keyframe_next = true;
     }
@@ -189,21 +210,26 @@ impl VideoEncoder {
 
         // Forced-keyframe path for M7. ffmpeg-the-third's `frame::Video`
         // doesn't expose `set_pict_type` directly, so we poke the AVFrame
-        // through the raw pointer. SAFETY: we hold `&mut self.frame` and the
-        // pointer is valid for the lifetime of the frame.
+        // through the raw pointer. SAFETY: we hold `&mut self.frame` and
+        // the pointer is valid for the lifetime of the frame.
+        //
+        // ffmpeg 8 removed the deprecated `AVFrame::key_frame` field; the
+        // replacement is the `AV_FRAME_FLAG_KEY` bit on `AVFrame::flags`.
+        // The encoder honours pict_type=I to force an IDR; the flag bit is
+        // for symmetry on the read side.
         if self.force_keyframe_next {
             unsafe {
                 let raw = self.frame.as_mut_ptr();
-                (*raw).pict_type = ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_I;
-                (*raw).key_frame = 1;
+                (*raw).pict_type = ffmpeg::ffi::AVPictureType::I;
+                (*raw).flags |= ffmpeg::ffi::AV_FRAME_FLAG_KEY;
             }
             self.force_keyframe_next = false;
         } else {
             // Reset to NONE so the encoder is free to choose.
             unsafe {
                 let raw = self.frame.as_mut_ptr();
-                (*raw).pict_type = ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
-                (*raw).key_frame = 0;
+                (*raw).pict_type = ffmpeg::ffi::AVPictureType::NONE;
+                (*raw).flags &= !ffmpeg::ffi::AV_FRAME_FLAG_KEY;
             }
         }
 
@@ -231,8 +257,7 @@ impl VideoEncoder {
                 // EAGAIN ("send more frames") and EOF (end of drain) both
                 // end the receive loop; ffmpeg's contract on receive_packet
                 // reserves Other{} for those.
-                Err(ffmpeg::Error::Eof) => break,
-                Err(ffmpeg::Error::Other { .. }) => break,
+                Err(ffmpeg::Error::Eof | ffmpeg::Error::Other { .. }) => break,
                 Err(e) => {
                     return Err(EncodeError::Ffmpeg {
                         context: "receive_packet",
@@ -266,7 +291,7 @@ impl Mp4Recorder {
 
         // Need to know whether the muxer wants global_header before we
         // configure the encoder. Open the output first.
-        let mut output = format::output(&path).ff("format::output")?;
+        let mut output = format::output(path).ff("format::output")?;
         let global_header = output
             .format()
             .flags()
