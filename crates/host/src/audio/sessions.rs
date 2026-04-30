@@ -42,10 +42,46 @@ impl<T> WinExt<T> for windows::core::Result<T> {
     }
 }
 
-/// Print the list of audio sessions on the default render endpoint.
-/// Each line is one session; the "Process" column is what you copy
-/// into `host.toml` under `[audio].blacklist`.
-pub fn list_audio_sessions() -> Result<(), ListError> {
+/// One audio session on the default render endpoint, in structured
+/// form. `process_name` is the leaf exe name (e.g. `chrome.exe`) and
+/// is what `host.toml`'s `[audio].blacklist` matches against.
+#[derive(Debug, Clone)]
+pub struct AudioSession {
+    pub pid: u32,
+    pub process_name: String,
+    /// Friendly display name from `IAudioSessionControl::GetDisplayName`.
+    /// Empty when the session didn't set one (most common — apps
+    /// rarely populate it).
+    pub display_name: String,
+    pub is_system: bool,
+    pub state: SessionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Active,
+    Inactive,
+    Expired,
+    Unknown,
+}
+
+impl SessionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Inactive => "Inactive",
+            Self::Expired => "Expired",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// Walk the session enumerator on the default render endpoint and
+/// collect each session as an `AudioSession`. Used by the CLI's
+/// `--list-audio-sessions` flag (via [`list_audio_sessions`]) and by
+/// the Tauri shell's audio-toggle UI.
+pub fn enumerate_sessions() -> Result<Vec<AudioSession>, ListError> {
+    let mut out = Vec::new();
     unsafe {
         // CoInitializeEx is per-thread; ignore the S_FALSE second-call.
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -66,18 +102,6 @@ pub fn list_audio_sessions() -> Result<(), ListError> {
             .GetCount()
             .ctx("IAudioSessionEnumerator::GetCount")?;
 
-        println!();
-        println!("Audio sessions on the default render endpoint ({count} total):");
-        println!();
-        println!(
-            "{:<6}  {:<9}  {:<6}  {:<28}  Display",
-            "PID", "State", "System", "Process",
-        );
-        println!(
-            "{:<6}  {:<9}  {:<6}  {:<28}  -------",
-            "----", "---------", "------", "----------------------------",
-        );
-
         for i in 0..count {
             let control = session_enum
                 .GetSession(i)
@@ -95,45 +119,79 @@ pub fn list_audio_sessions() -> Result<(), ListError> {
             let is_system = is_system_sounds_session(&control2);
 
             let state = match control.GetState() {
-                Ok(s) if s == AudioSessionStateActive => "Active",
-                Ok(s) if s == AudioSessionStateInactive => "Inactive",
-                Ok(s) if s == AudioSessionStateExpired => "Expired",
-                _ => "Unknown",
+                Ok(s) if s == AudioSessionStateActive => SessionState::Active,
+                Ok(s) if s == AudioSessionStateInactive => SessionState::Inactive,
+                Ok(s) if s == AudioSessionStateExpired => SessionState::Expired,
+                _ => SessionState::Unknown,
             };
 
-            // GetDisplayName returns a COM-allocated PWSTR. For a
-            // one-shot CLI tool we accept the tiny per-session leak
-            // rather than wiring CoTaskMemFree.
-            let display = control
+            // GetDisplayName returns a COM-allocated PWSTR. We accept
+            // the tiny per-session leak rather than wiring CoTaskMemFree.
+            let display_name = control
                 .GetDisplayName()
                 .ok()
                 .and_then(|p: PWSTR| if p.is_null() { None } else { p.to_string().ok() })
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "(none)".to_owned());
+                .unwrap_or_default();
 
-            let proc_name = if is_system {
+            let process_name = if is_system {
                 "System".to_owned()
             } else {
                 exe_name_for_pid(pid).unwrap_or_else(|| format!("pid:{pid}"))
             };
 
-            println!(
-                "{:<6}  {:<9}  {:<6}  {:<28}  {}",
+            out.push(AudioSession {
                 pid,
+                process_name,
+                display_name,
+                is_system,
                 state,
-                if is_system { "yes" } else { "-" },
-                proc_name,
-                display
-            );
+            });
         }
-        println!();
-        println!("Copy a value from the \"Process\" column (case-insensitive) into");
-        println!("host.toml under [audio].blacklist to exclude that app's audio");
-        println!("from the streamed mix. The host opens a per-process WASAPI");
-        println!("loopback for every non-blacklisted session and software-mixes");
-        println!("them into the Opus stream.");
-        println!();
     }
+    Ok(out)
+}
+
+/// Print the list of audio sessions on the default render endpoint.
+/// Each line is one session; the "Process" column is what you copy
+/// into `host.toml` under `[audio].blacklist`.
+pub fn list_audio_sessions() -> Result<(), ListError> {
+    let sessions = enumerate_sessions()?;
+    println!();
+    println!(
+        "Audio sessions on the default render endpoint ({} total):",
+        sessions.len()
+    );
+    println!();
+    println!(
+        "{:<6}  {:<9}  {:<6}  {:<28}  Display",
+        "PID", "State", "System", "Process",
+    );
+    println!(
+        "{:<6}  {:<9}  {:<6}  {:<28}  -------",
+        "----", "---------", "------", "----------------------------",
+    );
+    for s in &sessions {
+        println!(
+            "{:<6}  {:<9}  {:<6}  {:<28}  {}",
+            s.pid,
+            s.state.as_str(),
+            if s.is_system { "yes" } else { "-" },
+            s.process_name,
+            if s.display_name.is_empty() {
+                "(none)"
+            } else {
+                &s.display_name
+            },
+        );
+    }
+    println!();
+    println!("Copy a value from the \"Process\" column (case-insensitive) into");
+    println!("host.toml under [audio].blacklist to exclude that app's audio");
+    println!("from the streamed mix. The host opens a per-process WASAPI");
+    println!("loopback for every non-blacklisted session and software-mixes");
+    println!("them into the Opus stream.");
+    println!();
     Ok(())
 }
 

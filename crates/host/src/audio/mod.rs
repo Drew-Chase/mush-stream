@@ -34,7 +34,9 @@ use crate::config::AudioConfig;
 pub use self::capture::{CaptureError, LoopbackCapture};
 pub use self::encoder::{EncoderError, OpusEncoder};
 pub use self::mixer::{Mixer, MixerError};
-pub use self::sessions::list_audio_sessions;
+pub use self::sessions::{
+    enumerate_sessions, list_audio_sessions, AudioSession, SessionState,
+};
 
 /// 48 kHz is Opus's native rate; libopus accepts {8, 12, 16, 24, 48}
 /// but resamples internally for anything but 48. Picking 48 lets us
