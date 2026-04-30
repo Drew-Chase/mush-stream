@@ -12,6 +12,8 @@ pub struct Config {
     pub decode: DecodeConfig,
     #[serde(default)]
     pub audio: AudioConfig,
+    #[serde(default)]
+    pub input: InputConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +56,32 @@ pub struct DisplayConfig {
 
 fn default_title() -> String {
     "app".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputConfig {
+    /// Forward gamepad input to the host. When false, the gamepad
+    /// poll thread is not spawned at all — the client opens its
+    /// network and decode pipeline as usual but emits no
+    /// `InputPacket`s.
+    #[serde(default = "default_true")]
+    pub forward_pad: bool,
+    /// Gilrs gamepad id to forward exclusively (the `usize` from
+    /// `usize::from(gp.id())`, narrowed to `u32` for JSON-friendly
+    /// transport across the Tauri boundary). `None` selects the
+    /// first gamepad gilrs reports — backwards-compatible with the
+    /// pre-selection behavior.
+    #[serde(default)]
+    pub gamepad_id: Option<u32>,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            forward_pad: default_true(),
+            gamepad_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

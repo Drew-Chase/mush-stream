@@ -154,18 +154,41 @@ fn run_session(
         })
         .context("spawning decode thread")?;
 
-    // Gamepad thread (250 Hz). Always spawn; logs + exits cleanly if
-    // gilrs init fails or no pad is attached.
+    // Gamepad thread (250 Hz). Skipped entirely when `input.forward_pad`
+    // is false — saves the gilrs init cost and makes "no input
+    // forwarding" actually mean what it says rather than silently
+    // emitting packets the host then accepts as a virtual pad.
     let gamepad_shutdown = Arc::new(AtomicBool::new(false));
-    let gamepad_shutdown_for_thread = gamepad_shutdown.clone();
-    let gamepad_thread = std::thread::Builder::new()
-        .name("mush-input".into())
-        .spawn(move || {
-            if let Err(e) = run_gamepad_loop(input_tx, gamepad_shutdown_for_thread) {
-                tracing::error!(error = %e, "gamepad loop exited with error");
-            }
-        })
-        .context("spawning gamepad thread")?;
+    let gamepad_thread: Option<std::thread::JoinHandle<()>> =
+        if cfg.input.forward_pad {
+            let gamepad_shutdown_for_thread = gamepad_shutdown.clone();
+            let selected_id = cfg.input.gamepad_id;
+            Some(
+                std::thread::Builder::new()
+                    .name("mush-input".into())
+                    .spawn(move || {
+                        if let Err(e) = run_gamepad_loop(
+                            input_tx,
+                            gamepad_shutdown_for_thread,
+                            selected_id,
+                        ) {
+                            tracing::error!(
+                                error = %e,
+                                "gamepad loop exited with error"
+                            );
+                        }
+                    })
+                    .context("spawning gamepad thread")?,
+            )
+        } else {
+            tracing::info!(
+                "input.forward_pad = false; gamepad polling disabled"
+            );
+            // Drop the input channel sender so the network task's
+            // input sender exits cleanly when the runtime shuts down.
+            drop(input_tx);
+            None
+        };
 
     // Network runtime. Owned here on the runner thread; tasks run on
     // its worker pool. Dropping the runtime on shutdown aborts the
@@ -220,7 +243,9 @@ fn run_session(
     gamepad_shutdown.store(true, Ordering::Release);
 
     let _ = decode_thread.join();
-    let _ = gamepad_thread.join();
+    if let Some(h) = gamepad_thread {
+        let _ = h.join();
+    }
     if let Some(h) = audio_handle {
         let _ = h.join();
     }

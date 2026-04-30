@@ -6,6 +6,7 @@ mod addresses;
 mod audio_sessions;
 mod client_session;
 mod configs;
+mod gamepads;
 mod host_session;
 mod logs;
 mod monitors;
@@ -85,6 +86,7 @@ pub fn run() {
             client_session::client_connect,
             client_session::client_disconnect,
             client_session::client_status,
+            gamepads::gamepads_list,
             logs::logs_buffer,
         ])
         .run(tauri::generate_context!())

@@ -1556,6 +1556,53 @@ input, select {
     cursor: pointer;
 }
 
+/* Gamepad picker row — sits inside `.conn__opts`'s flex-wrap row.
+   Forces a 100% basis so it always wraps onto its own line, then
+   lays out the Select and the Refresh button side-by-side. */
+.conn__padpicker {
+    flex-basis: 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.conn__padselect {
+    flex: 1;
+    min-width: 0;
+}
+
+.conn__padselect-trigger {
+    min-height: 0 !important;
+    height: 32px !important;
+    background-color: var(--bg-2) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: var(--r-sm) !important;
+    box-shadow: none !important;
+}
+
+.conn__padselect-trigger:hover {
+    background-color: var(--bg-3) !important;
+}
+
+.conn__padselect-trigger[data-disabled="true"] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.conn__padselect-value {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.conn__padselect-popover {
+    background-color: var(--bg-2) !important;
+    border: 1px solid var(--line) !important;
+}
+
 /* connecting state */
 .connecting {
     padding: 32px;

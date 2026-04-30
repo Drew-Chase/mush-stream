@@ -82,7 +82,7 @@ pub fn default_host_config() -> HostConfig {
 
 pub fn default_client_config() -> ClientConfig {
     use mush_stream_client::config::{
-        AudioConfig, DecodeConfig, DisplayConfig, NetworkConfig,
+        AudioConfig, DecodeConfig, DisplayConfig, InputConfig, NetworkConfig,
     };
     ClientConfig {
         network: NetworkConfig {
@@ -106,6 +106,7 @@ pub fn default_client_config() -> ClientConfig {
             prefer_hardware: true,
         },
         audio: AudioConfig::default(),
+        input: InputConfig::default(),
     }
 }
 

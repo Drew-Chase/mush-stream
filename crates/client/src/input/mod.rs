@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use gilrs::{Axis, Button, Gamepad, Gilrs};
+use gilrs::{Axis, Button, Gamepad, GamepadId, Gilrs};
 use mush_stream_common::protocol::{control::ControlMessage, input::InputPacket};
 use tokio::sync::mpsc;
 
@@ -23,17 +23,65 @@ pub enum InputCommand {
     Control(ControlMessage),
 }
 
+/// One row in the gamepad-enumeration response surfaced to the
+/// frontend. `id` is `usize::from(GamepadId)` narrowed to `u32` so it
+/// crosses the Tauri JSON boundary cleanly; gilrs IDs are stable for
+/// the lifetime of a process.
+#[derive(Debug, Clone)]
+pub struct GamepadInfo {
+    pub id: u32,
+    pub name: String,
+    pub is_connected: bool,
+}
+
 /// 250 Hz cadence — 4000 µs between polls.
 const POLL_PERIOD: Duration = Duration::from_micros(4_000);
+
+/// Enumerate the gamepads gilrs currently sees. Spins up a fresh
+/// `Gilrs` handle (cheap) and drains any pending init events so a
+/// gamepad that was hot-plugged just before this call still shows up.
+///
+/// Returns an empty Vec when gilrs fails to initialize (common on
+/// systems without XInput / evdev / IOKit). Errors are logged at
+/// warn so the UI just shows "no gamepads detected" rather than
+/// throwing.
+pub fn list_gamepads() -> Vec<GamepadInfo> {
+    let mut gilrs = match Gilrs::new() {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = %e, "gilrs init failed during enumeration");
+            return Vec::new();
+        }
+    };
+    while gilrs.next_event().is_some() {}
+    gilrs
+        .gamepads()
+        .map(|(id, gp)| {
+            let raw: usize = id.into();
+            GamepadInfo {
+                id: u32::try_from(raw).unwrap_or(u32::MAX),
+                name: gp.name().to_owned(),
+                is_connected: gp.is_connected(),
+            }
+        })
+        .collect()
+}
 
 /// Run a blocking gamepad-poll loop. Sends an [`InputCommand::Input`] every
 /// 4 ms while a gamepad is connected. Exits when `shutdown` flips to true,
 /// when the channel is closed, or when gilrs initialization fails.
+///
+/// `selected_id` filters to a specific gilrs gamepad id; `None`
+/// preserves the original "first available" behavior. If a specific
+/// id is set but isn't present (unplugged after selection), the loop
+/// idles silently — re-plugging brings input back without a
+/// reconnect.
 #[allow(clippy::needless_pass_by_value)] // long-running thread entry; owns its inputs
 #[allow(clippy::unnecessary_wraps)] // Result kept for future fallible paths
 pub fn run_gamepad_loop(
     tx: mpsc::Sender<InputCommand>,
     shutdown: Arc<AtomicBool>,
+    selected_id: Option<u32>,
 ) -> Result<()> {
     let mut gilrs = match Gilrs::new() {
         Ok(g) => g,
@@ -42,30 +90,33 @@ pub fn run_gamepad_loop(
             return Ok(());
         }
     };
-    tracing::info!("gamepad polling at 250Hz; waiting for a connected pad");
+    tracing::info!(
+        selected_id = ?selected_id,
+        "gamepad polling at 250Hz; waiting for a connected pad"
+    );
 
     let mut next_tick = Instant::now() + POLL_PERIOD;
     let mut sequence: u16 = 0;
-    let mut last_pad_logged: bool = false;
+    let mut last_pad_logged: Option<GamepadId> = None;
 
     while !shutdown.load(Ordering::Acquire) {
         // Drain events to advance gamepad state.
         while gilrs.next_event().is_some() {}
 
-        let pad = gilrs.gamepads().next();
+        let pad = pick_gamepad(&gilrs, selected_id);
         match (pad, last_pad_logged) {
-            (Some((_id, gp)), false) => {
-                tracing::info!(name = gp.name(), "gamepad connected");
-                last_pad_logged = true;
+            (Some((id, gp)), prev) if prev != Some(id) => {
+                tracing::info!(name = gp.name(), id = ?id, "gamepad bound");
+                last_pad_logged = Some(id);
             }
-            (None, true) => {
-                tracing::info!("gamepad disconnected");
-                last_pad_logged = false;
+            (None, Some(_)) => {
+                tracing::info!("gamepad unbound");
+                last_pad_logged = None;
             }
             _ => {}
         }
 
-        if let Some((_id, gamepad)) = gilrs.gamepads().next() {
+        if let Some((_id, gamepad)) = pick_gamepad(&gilrs, selected_id) {
             let packet = build_input_packet(&gamepad, sequence);
             sequence = sequence.wrapping_add(1);
             match tx.try_send(InputCommand::Input(packet)) {
@@ -89,6 +140,22 @@ pub fn run_gamepad_loop(
     }
     tracing::info!("gamepad loop exiting");
     Ok(())
+}
+
+/// Resolve `selected_id` against the current gilrs gamepad list.
+/// `None` returns the first gamepad gilrs reports (matching the
+/// pre-selection default). `Some(id)` looks up by id and returns
+/// `None` when the chosen pad isn't currently connected.
+fn pick_gamepad(
+    gilrs: &Gilrs,
+    selected_id: Option<u32>,
+) -> Option<(GamepadId, Gamepad<'_>)> {
+    match selected_id {
+        None => gilrs.gamepads().next(),
+        Some(want) => gilrs
+            .gamepads()
+            .find(|(id, _)| u32::try_from(usize::from(*id)).unwrap_or(u32::MAX) == want),
+    }
 }
 
 /// Snapshot the gamepad's current state into an [`InputPacket`]. The

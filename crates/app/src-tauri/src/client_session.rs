@@ -44,6 +44,11 @@ pub struct ConnectOptions {
     pub hardware_decode: bool,
     #[serde(default = "default_true")]
     pub forward_pad: bool,
+    /// Specific gilrs gamepad id to forward, or `None` to take the
+    /// first one gilrs reports. Surfaced from the Connect page's
+    /// gamepad dropdown.
+    #[serde(default)]
+    pub gamepad_id: Option<u32>,
     #[serde(default = "default_true")]
     pub audio: bool,
 }
@@ -205,10 +210,8 @@ fn apply_options(cfg: &mut ClientConfig, opts: &ConnectOptions) -> Result<(), St
         .map_err(|e| format!("invalid address `{}`: {e}", opts.address))?;
     cfg.decode.prefer_hardware = opts.hardware_decode;
     cfg.audio.enabled = opts.audio;
-    // forward_pad isn't a runtime config flag for the existing client
-    // pipeline — it's compiled-in. Left as a UI passthrough until
-    // the runner exposes a knob.
-    let _ = opts.forward_pad;
+    cfg.input.forward_pad = opts.forward_pad;
+    cfg.input.gamepad_id = opts.gamepad_id;
     Ok(())
 }
 

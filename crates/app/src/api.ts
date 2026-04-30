@@ -94,6 +94,19 @@ export interface AudioSessionInfo {
 export const audioSessionsList = () =>
   invoke<AudioSessionInfo[]>("audio_sessions_list");
 
+// --- Gamepads --------------------------------------------------------
+
+export interface GamepadInfo {
+  /** gilrs gamepad id (`usize::from(GamepadId)` narrowed to u32).
+   *  Stable for the lifetime of the host process; pass back via
+   *  `ConnectOptions.gamepadId` to pin which controller forwards. */
+  id: number;
+  name: string;
+  isConnected: boolean;
+}
+
+export const gamepadsList = () => invoke<GamepadInfo[]>("gamepads_list");
+
 // --- Recents ---------------------------------------------------------
 
 export interface RecentEntry {
@@ -151,6 +164,11 @@ export interface ClientConfig {
   audio: {
     enabled: boolean;
   };
+  input: {
+    forward_pad: boolean;
+    /** gilrs gamepad id to forward, or null for "first available". */
+    gamepad_id: number | null;
+  };
 }
 
 export const configLoadHost = () => invoke<HostConfig>("config_load_host");
@@ -206,6 +224,9 @@ export interface ConnectOptions {
   address: string;
   hardwareDecode: boolean;
   forwardPad: boolean;
+  /** gilrs gamepad id to forward exclusively, or null for "first
+   *  available". Surfaced from the Connect page's gamepad dropdown. */
+  gamepadId: number | null;
   audio: boolean;
 }
 

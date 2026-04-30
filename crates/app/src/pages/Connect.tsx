@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
+import { Select, SelectItem } from "@heroui/react";
 import {
   IcCheck,
   IcChevron,
@@ -12,8 +13,10 @@ import { useHosting } from "../hosting";
 import {
   clientConnect,
   clientDisconnect,
+  gamepadsList,
   recentsAdd,
   type ClientState,
+  type GamepadInfo,
 } from "../api";
 
 export default function Connect() {
@@ -70,10 +73,42 @@ function IdleScreen({
   const [forwardPad, setForwardPad] = useState(true);
   const [debug, setDebug] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [gamepads, setGamepads] = useState<GamepadInfo[]>([]);
+  // `null` selects the first available pad (gilrs default). The
+  // Select renders this as the "Auto" item so the user can revert
+  // to the implicit-pick behavior.
+  const [gamepadId, setGamepadId] = useState<number | null>(null);
+  const [gamepadsLoading, setGamepadsLoading] = useState(false);
 
   useEffect(() => {
     if (prefill) setAddr(prefill);
   }, [prefill]);
+
+  // Initial enumeration on mount, plus a manual Refresh button below.
+  // gilrs reports the controllers Windows already has bound at the
+  // time this runs; hot-plugging mid-session won't reflect here
+  // until the user clicks Refresh.
+  const refreshGamepads = async () => {
+    setGamepadsLoading(true);
+    try {
+      const list = await gamepadsList();
+      setGamepads(list);
+      // If the previously-selected pad is gone, fall back to Auto so
+      // the user isn't silently stuck on a disconnected device id.
+      if (gamepadId !== null && !list.some((g) => g.id === gamepadId)) {
+        setGamepadId(null);
+      }
+    } catch (e) {
+      console.error("gamepads_list failed", e);
+    } finally {
+      setGamepadsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refreshGamepads();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const valid = /^[\w.-]+:\d{2,5}$/.test(addr);
 
@@ -85,6 +120,7 @@ function IdleScreen({
         address: addr,
         hardwareDecode: hwdec,
         forwardPad,
+        gamepadId: forwardPad ? gamepadId : null,
         audio: true, // wired through saved client config
       });
       // Persist the recent on a successful spawn — actual connection
@@ -170,6 +206,67 @@ function IdleScreen({
               />{" "}
               Forward gamepad
             </label>
+            <div className="conn__padpicker">
+              <Select
+                size="sm"
+                variant="bordered"
+                aria-label="Gamepad to forward"
+                isDisabled={!forwardPad || busy}
+                selectedKeys={[
+                  gamepadId === null ? "auto" : String(gamepadId),
+                ]}
+                onSelectionChange={(keys) => {
+                  const first = Array.from(keys)[0];
+                  if (first === undefined || first === "auto") {
+                    setGamepadId(null);
+                    return;
+                  }
+                  const n = Number(first);
+                  setGamepadId(Number.isNaN(n) ? null : n);
+                }}
+                className="conn__padselect"
+                classNames={{
+                  trigger: "conn__padselect-trigger",
+                  value: "conn__padselect-value",
+                  popoverContent: "conn__padselect-popover",
+                }}
+                renderValue={(items) =>
+                  items.map((item) => (
+                    <span key={item.key}>{item.textValue}</span>
+                  ))
+                }
+              >
+                {[
+                  <SelectItem
+                    key="auto"
+                    textValue={
+                      gamepads.length === 0
+                        ? "Auto · no gamepads detected"
+                        : `Auto · first available (${gamepads[0].name})`
+                    }
+                  >
+                    {gamepads.length === 0
+                      ? "Auto · no gamepads detected"
+                      : `Auto · first available (${gamepads[0].name})`}
+                  </SelectItem>,
+                  ...gamepads.map((g) => (
+                    <SelectItem
+                      key={String(g.id)}
+                      textValue={`${g.name}${g.isConnected ? "" : " · disconnected"}`}
+                    >
+                      {g.name}
+                      {g.isConnected ? "" : " · disconnected"}
+                    </SelectItem>
+                  )),
+                ]}
+              </Select>
+              <Btn
+                onClick={() => void refreshGamepads()}
+                disabled={gamepadsLoading || busy}
+              >
+                {gamepadsLoading ? "Refreshing…" : "Refresh"}
+              </Btn>
+            </div>
             <label className="conn__opt">
               <input
                 type="checkbox"
