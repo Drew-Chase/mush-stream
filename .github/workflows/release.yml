@@ -148,7 +148,11 @@ jobs:
       - name: Download ViGEmBus installer
         shell: pwsh
         run: |
-          $url = "https://github.com/nefarius/ViGEmBus/releases/download/v1.18.367/ViGEmBus_1.18.367_x64_x86.exe"
+          # ViGEmBus's release tags use a four-segment scheme
+          # (`v1.18.367.0`); the file name on disk drops the trailing
+          # zero. The `.0` was missing on the first CI run and the
+          # download 404'd, so be explicit.
+          $url = "https://github.com/nefarius/ViGEmBus/releases/download/v1.18.367.0/ViGEmBus_1.18.367_x64_x86.exe"
           $dest = "$env:GITHUB_WORKSPACE\ViGEmBus_1.18.367_x64_x86.exe"
           Invoke-WebRequest -Uri $url -OutFile $dest
           Write-Host "ViGEmBus downloaded to $dest"
