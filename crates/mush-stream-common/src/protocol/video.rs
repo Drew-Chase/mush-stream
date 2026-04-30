@@ -238,9 +238,6 @@ impl VideoFramer {
     where
         F: FnMut(&[u8]),
     {
-        let frame_id = self.next_frame_id;
-        self.next_frame_id = self.next_frame_id.wrapping_add(1);
-
         let data_count = nal.len().div_ceil(MAX_PAYLOAD).max(1);
         // Saturate parity_count at u8::MAX-1 (255 is a valid u8 but we want
         // some headroom; reed-solomon-erasure rejects total_shards > 256
@@ -250,11 +247,18 @@ impl VideoFramer {
         let raw_parity =
             ((data_count as f64 * f64::from(parity_ratio)).ceil() as usize).max(1);
         let parity_count = raw_parity.min(255_usize.saturating_sub(data_count.min(255)));
+
+        // RS galois_8 caps total shards at 256. For NALs that exceed this
+        // (large IDRs at high-resolution × high-bitrate), fall back to
+        // plain framing. The frame still delivers; if any packet of it
+        // drops the client's keyframe-on-loss flow re-requests. Better
+        // than dropping the whole frame.
         if data_count + parity_count > 256 {
-            return Err(ProtocolError::Fec(format!(
-                "data ({data_count}) + parity ({parity_count}) > 256 — frame too large for galois_8 RS",
-            )));
+            return Ok(self.frame(nal, timestamp_us, is_keyframe, emit));
         }
+
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self.next_frame_id.wrapping_add(1);
 
         let last_data_size = if nal.is_empty() {
             0
