@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    mush_stream_lib::run()
+    mush_stream_lib::run();
 }

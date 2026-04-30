@@ -20,10 +20,27 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 serde_json = "1"
+toml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util"] }
+local-ip-address = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+png = { workspace = true }
+base64 = "0.22"
+# Extends the workspace `windows` features with the registry API used to
+# read the ViGEmBus driver version, plus the DXGI types we need to
+# enumerate adapters for the GPU label in the sidebar.
+windows = { workspace = true, features = ["Win32_System_Registry"] }
 
 # The mush libraries
 mush-stream-client = { path = "../../client" }
 mush-stream-host = { path = "../../host" }
 mush-stream-common = { path = "../../common" }
+
+[lints]
+workspace = true
