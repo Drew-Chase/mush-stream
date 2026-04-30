@@ -12,6 +12,7 @@
 //!   reassembled frames via tokio mpsc::Receiver::blocking_recv and pushing
 //!   decoded RGBA via `EventLoopProxy::send_event` to the main thread.
 
+mod audio;
 mod config;
 mod decode;
 mod display;
@@ -42,6 +43,7 @@ struct Cli {
     config: PathBuf,
 }
 
+#[allow(clippy::too_many_lines)] // main wires several subsystems together
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -86,6 +88,27 @@ fn main() -> Result<()> {
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<InputCommand>(64);
     let keyframe_tx = input_tx.clone();
 
+    // Audio path: receiver → audio decode/playback thread.
+    let audio_enabled = cfg.audio.enabled;
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<
+        mush_stream_common::protocol::audio::AudioPacket,
+    >(32);
+    let audio_handle = if audio_enabled {
+        Some(
+            std::thread::Builder::new()
+                .name("mush-audio".into())
+                .spawn(move || {
+                    if let Err(e) = audio::run_audio_loop(audio_rx) {
+                        tracing::error!(error = %e, "audio loop exited with error");
+                    }
+                })
+                .context("spawning audio thread")?,
+        )
+    } else {
+        tracing::info!("audio disabled in config; not playing");
+        None
+    };
+
     // Gamepad thread (250 Hz). Always spawn; it'll log + exit cleanly if
     // gilrs init fails or no pad is attached.
     let gamepad_shutdown = Arc::new(AtomicBool::new(false));
@@ -118,8 +141,9 @@ fn main() -> Result<()> {
                     }
                 };
                 let send_socket = socket.clone();
+                let audio_out = if audio_enabled { Some(audio_tx) } else { None };
                 let receive = tokio::spawn(async move {
-                    match run_video_receiver(socket, frame_tx, Some(keyframe_tx)).await {
+                    match run_video_receiver(socket, frame_tx, Some(keyframe_tx), audio_out).await {
                         Ok(stats) => tracing::info!(?stats, "video receiver stopped"),
                         Err(e) => tracing::error!(error = %e, "video receiver failed"),
                     }
@@ -147,6 +171,7 @@ fn main() -> Result<()> {
     let _ = decode_thread; // detach
     let _ = net_thread; // detach
     let _ = gamepad_thread; // detach
+    let _ = audio_handle; // detach
 
     tracing::info!(
         frames_presented = app.stats.frames_presented,

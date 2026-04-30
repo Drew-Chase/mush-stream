@@ -10,6 +10,26 @@ pub struct Config {
     pub network: NetworkConfig,
     pub display: DisplayConfig,
     pub decode: DecodeConfig,
+    #[serde(default)]
+    pub audio: AudioConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioConfig {
+    /// Play the host's audio stream through the default output device.
+    /// Set false to mute the audio path locally without touching the
+    /// host's capture (useful if you want to listen to your own
+    /// machine's audio while screen-sharing).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

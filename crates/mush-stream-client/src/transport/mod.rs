@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mush_stream_common::protocol::{
+    audio::{self, AudioPacket},
     control::{self, ControlMessage},
     input,
     video::{self, ReassembledFrame, VideoReassembler, VideoPacketHeader, HEADER_SIZE},
@@ -121,6 +122,7 @@ pub async fn run_video_receiver(
     socket: Arc<UdpSocket>,
     out: mpsc::Sender<DeliveredFrame>,
     request_keyframe_send: Option<mpsc::Sender<crate::input::InputCommand>>,
+    audio_out: Option<mpsc::Sender<AudioPacket>>,
 ) -> std::io::Result<ReceiverStats> {
     use crate::input::InputCommand;
 
@@ -172,11 +174,28 @@ pub async fn run_video_receiver(
         packets_this_sec += 1;
         bytes_this_sec = bytes_this_sec.saturating_add(len as u64);
 
-        // Peek at the header just to grab `frame_id` for the first-seen
-        // tracking. Reassembler will re-parse the same bytes.
+        // Peek at the header to dispatch audio vs video and to grab
+        // `frame_id` for the video first-seen tracking. Reassembler
+        // will re-parse video bytes; audio short-circuits here.
         if len >= HEADER_SIZE
             && let Ok(header) = VideoPacketHeader::read_from(&buf[..len])
         {
+            if header.is_audio() {
+                if let Some(tx) = audio_out.as_ref() {
+                    match audio::read_packet(&buf[..len]) {
+                        Ok(pkt) => {
+                            // try_send so audio backpressure doesn't
+                            // back up UDP recv into the kernel buffer.
+                            let _ = tx.try_send(pkt);
+                        }
+                        Err(e) => {
+                            stats.malformed += 1;
+                            tracing::debug!(error = %e, "malformed audio packet");
+                        }
+                    }
+                }
+                continue;
+            }
             first_packet
                 .entry(header.frame_id)
                 .or_insert_with(Instant::now);
