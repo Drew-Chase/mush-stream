@@ -116,6 +116,7 @@ pub async fn connect_to_host(host: SocketAddr) -> std::io::Result<Arc<UdpSocket>
 /// pushes [`DeliveredFrame`]s to `out`. Detects forward gaps in
 /// `frame_id` (or a non-IDR first frame) and sends `RequestKeyframe`
 /// back through the same socket via `request_keyframe_send`.
+#[allow(clippy::too_many_lines)] // single coherent loop; refactor would scatter state
 pub async fn run_video_receiver(
     socket: Arc<UdpSocket>,
     out: mpsc::Sender<DeliveredFrame>,
@@ -130,6 +131,13 @@ pub async fn run_video_receiver(
     let mut last_request = Instant::now()
         .checked_sub(KEYFRAME_REQUEST_DEBOUNCE * 2)
         .unwrap_or_else(Instant::now);
+    // Per-second throughput counters (reset each tick) so info-level
+    // logs can show whether the receive side stops getting packets
+    // during a perceived stall.
+    let mut packets_this_sec: u64 = 0;
+    let mut bytes_this_sec: u64 = 0;
+    let mut frames_this_sec: u64 = 0;
+    let mut last_log = Instant::now();
 
     // Per-frame-id arrival time of the first packet seen, kept until the
     // frame either completes or gets cleaned up.
@@ -161,6 +169,8 @@ pub async fn run_video_receiver(
         };
         stats.packets_received += 1;
         stats.bytes_received += len as u64;
+        packets_this_sec += 1;
+        bytes_this_sec = bytes_this_sec.saturating_add(len as u64);
 
         // Peek at the header just to grab `frame_id` for the first-seen
         // tracking. Reassembler will re-parse the same bytes.
@@ -175,6 +185,7 @@ pub async fn run_video_receiver(
         match reasm.ingest(&buf[..len]) {
             Ok(Some(frame)) => {
                 stats.frames_completed += 1;
+                frames_this_sec += 1;
                 match (last_complete_id, frame.is_keyframe) {
                     (None, false) => {
                         request_keyframe(
@@ -217,6 +228,25 @@ pub async fn run_video_receiver(
         }
         stats.dropped_old = reasm.dropped_old;
         stats.dropped_evicted = reasm.dropped_evicted;
+
+        // Once per second emit a throughput line. If the user reports a
+        // stall, the counter going to zero here pinpoints it as a
+        // receive-side or upstream issue (no packets arriving); if
+        // counters stay healthy the stall is in decode/render.
+        if last_log.elapsed() >= Duration::from_secs(1) {
+            tracing::info!(
+                packets = packets_this_sec,
+                bytes = bytes_this_sec,
+                frames = frames_this_sec,
+                gaps = stats.detected_gaps,
+                keyframe_requests = stats.keyframe_requests_sent,
+                "client recv throughput (1s)"
+            );
+            packets_this_sec = 0;
+            bytes_this_sec = 0;
+            frames_this_sec = 0;
+            last_log = Instant::now();
+        }
 
         // Bound the first_packet map: anything older than the latest
         // completed-or-evicted frame_id is stale.
