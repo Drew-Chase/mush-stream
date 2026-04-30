@@ -17,13 +17,11 @@ mod decode;
 mod display;
 mod input;
 mod transport;
-mod upnp;
 
 use std::{path::PathBuf, sync::atomic::AtomicBool, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use mush_stream_common::protocol::video::ReassembledFrame;
 use tracing_subscriber::EnvFilter;
 use winit::event_loop::EventLoopProxy;
 
@@ -31,8 +29,7 @@ use crate::config::{Config, DecodeConfig, DisplayConfig};
 use crate::decode::VideoDecoder;
 use crate::display::{DisplayApp, UserEvent};
 use crate::input::{run_gamepad_loop, InputCommand};
-use crate::transport::{run_input_sender, run_video_receiver, InputSender};
-use crate::upnp::UpnpForward;
+use crate::transport::{connect_to_host, run_input_sender, run_video_receiver, DeliveredFrame};
 
 /// `mush-stream-client` — receives streamed video over UDP, decodes via
 /// ffmpeg, presents via winit + pixels, and forwards gamepad input to the
@@ -58,17 +55,13 @@ fn main() -> Result<()> {
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading client config from {}", config_path.display()))?;
 
-    // Optional UPnP port forwarding for the video receive port, held for
-    // the lifetime of main. Drop unmaps the port at process exit.
-    let _upnp_guard = if cfg.network.enable_upnp {
-        UpnpForward::try_forward_udp(cfg.network.video_bind.port(), "mush-stream-client video")
-    } else {
-        None
-    };
-
     let (event_loop, proxy) = display::build_event_loop()?;
-    let (frame_tx, frame_rx) =
-        tokio::sync::mpsc::channel::<ReassembledFrame>(transport::REASM_MAX_PENDING * 2);
+    // Small bound on purpose: any backlog here is lag the user will see.
+    // 16 frames is ~250ms slack at 60fps — enough to absorb a tokio
+    // scheduling hiccup, far short of "hide a chronic bottleneck and
+    // ship stale frames forever". The 8 MiB UDP recv buffer is what
+    // absorbs network bursts; this channel must NOT double-buffer them.
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<DeliveredFrame>(16);
 
     // Decode thread.
     let proxy_for_decode = proxy.clone();
@@ -104,8 +97,7 @@ fn main() -> Result<()> {
         .context("spawning gamepad thread")?;
 
     // Network thread (own a tokio runtime so async UDP works).
-    let video_bind = cfg.network.video_bind;
-    let host_input_addr = cfg.network.host_input_addr;
+    let host_addr = cfg.network.host;
     let net_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -115,23 +107,22 @@ fn main() -> Result<()> {
         .name("mush-net".into())
         .spawn(move || {
             net_runtime.block_on(async move {
-                let input_sender = match InputSender::connect(host_input_addr).await {
-                    Ok(s) => Some(s),
+                let socket = match connect_to_host(host_addr).await {
+                    Ok(s) => s,
                     Err(e) => {
-                        tracing::error!(error = %e, "input sender bind failed");
-                        None
+                        tracing::error!(error = %e, "client socket connect failed");
+                        return;
                     }
                 };
+                let send_socket = socket.clone();
                 let receive = tokio::spawn(async move {
-                    match run_video_receiver(video_bind, frame_tx, Some(keyframe_tx)).await {
+                    match run_video_receiver(socket, frame_tx, Some(keyframe_tx)).await {
                         Ok(stats) => tracing::info!(?stats, "video receiver stopped"),
                         Err(e) => tracing::error!(error = %e, "video receiver failed"),
                     }
                 });
                 let send = tokio::spawn(async move {
-                    if let Some(sender) = input_sender {
-                        run_input_sender(sender, input_rx).await;
-                    }
+                    run_input_sender(send_socket, input_rx).await;
                 });
                 let _ = tokio::join!(receive, send);
             });
@@ -156,7 +147,7 @@ fn main() -> Result<()> {
 
     tracing::info!(
         frames_presented = app.stats.frames_presented,
-        last_glass_to_glass_us = ?app.stats.last_glass_to_glass_us,
+        last_lag_us = ?app.stats.last_lag_us,
         cumulative_min_us = if app.stats.cumulative_samples > 0 {
             app.stats.cumulative_min_us
         } else {
@@ -173,10 +164,11 @@ fn main() -> Result<()> {
 /// Decodes reassembled NAL frames and forwards decoded RGBA frames to the
 /// winit event loop. Runs until `frame_rx` is closed (network task gone) or
 /// the proxy returns `EventLoopClosed`.
+#[allow(clippy::needless_pass_by_value)] // long-running thread entry; owns its inputs
 fn run_decode_loop(
     decode_cfg: DecodeConfig,
     display_cfg: DisplayConfig,
-    mut frame_rx: tokio::sync::mpsc::Receiver<ReassembledFrame>,
+    mut frame_rx: tokio::sync::mpsc::Receiver<DeliveredFrame>,
     proxy: EventLoopProxy<UserEvent>,
 ) -> Result<()> {
     let mut decoder = VideoDecoder::new(
@@ -185,21 +177,29 @@ fn run_decode_loop(
         display_cfg.height,
     )
     .context("initializing video decoder")?;
-    tracing::info!(backend = decoder.backend(), "decoder ready");
+    let backend = decoder.backend();
+    tracing::info!(backend, "decoder ready");
 
     let proxy = Arc::new(proxy);
+    // Tell the display thread which backend was selected so the debug
+    // overlay (Ctrl+Alt+D) can show it.
+    let _ = proxy.send_event(UserEvent::DecoderReady { backend });
     let mut event_loop_alive = true;
     let mut decoded_frames: u64 = 0;
     let mut decode_errors: u64 = 0;
 
-    while let Some(reassembled) = frame_rx.blocking_recv() {
+    while let Some(delivered) = frame_rx.blocking_recv() {
         if !event_loop_alive {
             // No point decoding if there's no one to draw it.
             break;
         }
         let proxy_clone = proxy.clone();
         let mut alive = event_loop_alive;
-        let res = decoder.push_nal(&reassembled.nal, reassembled.timestamp_us, |frame| {
+        let DeliveredFrame {
+            reassembled,
+            first_packet_instant,
+        } = delivered;
+        let res = decoder.push_nal(&reassembled.nal, first_packet_instant, |frame| {
             if alive && proxy_clone.send_event(UserEvent::Frame(frame)).is_err() {
                 alive = false;
             }

@@ -14,17 +14,12 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NetworkConfig {
-    /// UDP socket the client binds locally to receive video.
-    pub video_bind: SocketAddr,
-    /// Address of the host's input/control listener.
-    pub host_input_addr: SocketAddr,
-    /// When true, attempt to forward `video_bind`'s UDP port through the
-    /// local router via UPnP at startup, so the host can reach us
-    /// without manual port forwarding. Defaults to false (matching the
-    /// spec's "use Tailscale, no NAT traversal" stance — flip on only
-    /// if you're not behind a VPN).
-    #[serde(default)]
-    pub enable_upnp: bool,
+    /// Host's UDP address — `<ip>:<port>`. The client connects its UDP
+    /// socket here and sends a discovery probe at startup; the host
+    /// learns the client's address from that packet's source field and
+    /// sends video back to it (UDP hole-punch). The client doesn't need
+    /// to bind a specific port on its end.
+    pub host: SocketAddr,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -29,6 +29,8 @@ const POLL_PERIOD: Duration = Duration::from_micros(4_000);
 /// Run a blocking gamepad-poll loop. Sends an [`InputCommand::Input`] every
 /// 4 ms while a gamepad is connected. Exits when `shutdown` flips to true,
 /// when the channel is closed, or when gilrs initialization fails.
+#[allow(clippy::needless_pass_by_value)] // long-running thread entry; owns its inputs
+#[allow(clippy::unnecessary_wraps)] // Result kept for future fallible paths
 pub fn run_gamepad_loop(
     tx: mpsc::Sender<InputCommand>,
     shutdown: Arc<AtomicBool>,
@@ -67,12 +69,9 @@ pub fn run_gamepad_loop(
             let packet = build_input_packet(&gamepad, sequence);
             sequence = sequence.wrapping_add(1);
             match tx.try_send(InputCommand::Input(packet)) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Network task can't keep up; drop to avoid backing up.
-                    // For 4 ms cadence dropping a few is preferable to
-                    // queueing latency.
-                }
+                // Full: network task can't keep up; drop. For 4 ms cadence,
+                // dropping a tick is preferable to queueing latency.
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
@@ -145,12 +144,10 @@ fn build_input_packet(gp: &Gamepad<'_>, sequence: u16) -> InputPacket {
     // back to the Z axis (some platforms expose triggers there).
     let lt = gp
         .button_data(Button::LeftTrigger2)
-        .map(|d| d.value())
-        .unwrap_or_else(|| gp.value(Axis::LeftZ).max(0.0));
+        .map_or_else(|| gp.value(Axis::LeftZ).max(0.0), gilrs::ev::state::ButtonData::value);
     let rt = gp
         .button_data(Button::RightTrigger2)
-        .map(|d| d.value())
-        .unwrap_or_else(|| gp.value(Axis::RightZ).max(0.0));
+        .map_or_else(|| gp.value(Axis::RightZ).max(0.0), gilrs::ev::state::ButtonData::value);
 
     InputPacket {
         buttons,

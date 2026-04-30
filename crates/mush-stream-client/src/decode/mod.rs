@@ -45,9 +45,29 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Tightly-packed RGBA, length = `width * height * 4`.
     pub rgba: Vec<u8>,
-    /// Host capture timestamp from the wire header (microseconds since UNIX
-    /// epoch). Used by M5 latency measurement.
-    pub timestamp_us: u64,
+    /// `Instant` at which the *first* packet of this frame's NAL arrived
+    /// at the client. Used for client-side lag measurement: present-time
+    /// minus this gives the network-arrival → display latency, in a way
+    /// that doesn't require synchronized clocks across machines.
+    pub first_packet_instant: std::time::Instant,
+    /// Size in bytes of the encoded NAL the decoder consumed to produce
+    /// this frame. The display thread uses these to compute a rolling
+    /// bitrate for the debug overlay.
+    pub encoded_bytes: usize,
+}
+
+impl std::fmt::Debug for DecodedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Elide the rgba bytes — at 2560×1440 they're ~14 MB and would
+        // flood any logger that printed the enclosing UserEvent.
+        f.debug_struct("DecodedFrame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("rgba_len", &self.rgba.len())
+            .field("first_packet_instant", &self.first_packet_instant)
+            .field("encoded_bytes", &self.encoded_bytes)
+            .finish()
+    }
 }
 
 /// H.264 decoder. Internally lazy: the swscale converter is built on the
@@ -92,7 +112,7 @@ impl VideoDecoder {
             match codec::Context::new_with_codec(codec)
                 .decoder()
                 .open_as(codec)
-                .and_then(|o| o.video())
+                .and_then(codec::decoder::Opened::video)
             {
                 Ok(decoder) => {
                     tracing::info!(backend = name, "video decoder opened");
@@ -126,8 +146,9 @@ impl VideoDecoder {
     }
 
     /// Push one reassembled NAL unit (Annex-B with inline SPS/PPS for IDR).
-    /// `timestamp_us` is the host capture timestamp from the wire header,
-    /// preserved through to the produced [`DecodedFrame`] for latency
+    /// `first_packet_instant` is the local `Instant` at which the first
+    /// packet of this NAL arrived at the client; the resulting
+    /// [`DecodedFrame`] propagates it to the display layer for lag
     /// measurement.
     ///
     /// May yield 0 or more decoded frames (SPS-only inputs yield nothing;
@@ -136,12 +157,13 @@ impl VideoDecoder {
     pub fn push_nal<F>(
         &mut self,
         nal: &[u8],
-        timestamp_us: u64,
+        first_packet_instant: std::time::Instant,
         mut on_frame: F,
     ) -> Result<(), DecodeError>
     where
         F: FnMut(DecodedFrame),
     {
+        let encoded_bytes = nal.len();
         let packet = Packet::copy(nal);
         self.decoder.send_packet(&packet).ff("send_packet")?;
 
@@ -154,13 +176,13 @@ impl VideoDecoder {
                         width: self.dst_width,
                         height: self.dst_height,
                         rgba,
-                        timestamp_us,
+                        first_packet_instant,
+                        encoded_bytes,
                     });
                 }
                 // EAGAIN ("send more packets") and EOF (drained on shutdown)
                 // both end the receive loop.
-                Err(ffmpeg::Error::Eof) => break,
-                Err(ffmpeg::Error::Other { .. }) => break,
+                Err(ffmpeg::Error::Eof | ffmpeg::Error::Other { .. }) => break,
                 Err(e) => {
                     return Err(DecodeError::Ffmpeg {
                         context: "receive_frame",
@@ -179,15 +201,11 @@ impl VideoDecoder {
 
         // (Re)build the scaler if the stream's source params changed (or
         // it's the first frame).
-        let needs_rebuild = self
-            .scaler
-            .as_ref()
-            .map(|s| {
-                s.input().format != src_format
-                    || s.input().width != src_width
-                    || s.input().height != src_height
-            })
-            .unwrap_or(true);
+        let needs_rebuild = self.scaler.as_ref().is_none_or(|s| {
+            s.input().format != src_format
+                || s.input().width != src_width
+                || s.input().height != src_height
+        });
         if needs_rebuild {
             self.scaler = Some(
                 scaling::Context::get(

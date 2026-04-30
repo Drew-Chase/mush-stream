@@ -1,4 +1,4 @@
-//! winit + pixels presentation.
+//! winit + pixels presentation, plus an opt-in debug overlay (Ctrl+Alt+D).
 //!
 //! winit 0.30 requires the event loop to live on the main thread, so the
 //! decode + network workers run on background threads and push decoded
@@ -8,13 +8,18 @@
 //! `SurfaceTexture<'_, W>`) gets a `'static` lifetime — fine for our
 //! single-window CLI; the OS reclaims everything on process exit.
 
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
+use font8x8::UnicodeFonts;
 use pixels::{Pixels, SurfaceTexture};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::WindowEvent,
+    event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Fullscreen, Window, WindowAttributes, WindowId},
 };
 
@@ -26,15 +31,21 @@ use crate::decode::DecodedFrame;
 pub enum UserEvent {
     /// A new decoded frame is ready to present.
     Frame(DecodedFrame),
+    /// Decoder finished init; report the chosen backend to display so the
+    /// debug overlay can name it.
+    DecoderReady { backend: &'static str },
     /// Worker is shutting down (e.g. UDP socket closed). Exit the event loop.
     WorkerExited,
 }
 
-/// Latency stats observed at present time.
+/// Lag stats observed at present time. "Lag" here is the network-arrival
+/// → on-screen delay, measured locally via `Instant` so it's honest
+/// regardless of cross-machine clock skew. The capture/encode/wire
+/// portion of true glass-to-glass is constant and not included.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PresentStats {
     pub frames_presented: u64,
-    pub last_glass_to_glass_us: Option<u64>,
+    pub last_lag_us: Option<u64>,
     pub cumulative_min_us: u64,
     pub cumulative_max_us: u64,
     pub cumulative_sum_us: u64,
@@ -48,8 +59,8 @@ impl PresentStats {
     }
 }
 
-/// Rolling window of glass-to-glass latency samples. Logs a percentile
-/// snapshot each time the window fills.
+/// Rolling window of lag samples. Logs a percentile snapshot each time
+/// the window fills.
 #[derive(Debug)]
 struct LatencyTracker {
     capacity: usize,
@@ -71,6 +82,9 @@ impl LatencyTracker {
         }
         self.samples.sort_unstable();
         let n = self.samples.len();
+        // Window capacity is small (~60), so usize→f64 precision loss
+        // isn't a concern.
+        #[allow(clippy::cast_precision_loss)]
         let pct = |p: f64| self.samples[((n as f64 - 1.0) * p).round() as usize];
         let snap = LatencySnapshot {
             count: n as u64,
@@ -98,6 +112,9 @@ pub struct LatencySnapshot {
     pub avg_us: u64,
 }
 
+/// Sliding window for the FPS and bitrate readouts in the debug overlay.
+const OVERLAY_WINDOW: Duration = Duration::from_secs(2);
+
 pub struct DisplayApp {
     config: DisplayConfig,
     window: Option<&'static Window>,
@@ -106,13 +123,20 @@ pub struct DisplayApp {
     /// Cumulative present stats; observers can read this after exit.
     pub stats: PresentStats,
     latency_tracker: LatencyTracker,
+
+    // ---- Debug overlay state (Ctrl+Alt+D toggles `show_debug`) ----
+    show_debug: bool,
+    modifiers: ModifiersState,
+    backend: Option<&'static str>,
+    last_snapshot: Option<LatencySnapshot>,
+    /// Presentation timestamps over `OVERLAY_WINDOW` for FPS estimation.
+    present_window: VecDeque<Instant>,
+    /// (arrival time, encoded NAL bytes) over `OVERLAY_WINDOW` for bitrate.
+    bitrate_window: VecDeque<(Instant, usize)>,
 }
 
 impl DisplayApp {
     pub fn new(config: DisplayConfig) -> Self {
-        // Window of 60 samples ≈ 1 second at 60fps. Logs a snapshot per
-        // window so glass-to-glass percentiles are visible at info level
-        // without flooding for every frame.
         Self {
             config,
             window: None,
@@ -123,6 +147,12 @@ impl DisplayApp {
                 ..PresentStats::default()
             },
             latency_tracker: LatencyTracker::new(60),
+            show_debug: false,
+            modifiers: ModifiersState::empty(),
+            backend: None,
+            last_snapshot: None,
+            present_window: VecDeque::with_capacity(128),
+            bitrate_window: VecDeque::with_capacity(128),
         }
     }
 }
@@ -160,7 +190,7 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
                 tracing::info!(
                     width = self.config.width,
                     height = self.config.height,
-                    "display window created"
+                    "display window created (Ctrl+Alt+D toggles debug overlay)"
                 );
             }
             Err(e) => {
@@ -181,49 +211,26 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
                 tracing::info!("window close requested");
                 event_loop.exit();
             }
-            WindowEvent::RedrawRequested => {
-                if let (Some(frame), Some(pixels)) = (self.last_frame.as_ref(), self.pixels.as_mut())
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+            }
+            WindowEvent::KeyboardInput { event: ke, .. } => {
+                // Ctrl+Alt+D toggles the debug overlay. Suppress on
+                // auto-repeat so holding it down doesn't strobe.
+                if matches!(ke.state, ElementState::Pressed)
+                    && !ke.repeat
+                    && let PhysicalKey::Code(KeyCode::KeyD) = ke.physical_key
+                    && self.modifiers.control_key()
+                    && self.modifiers.alt_key()
                 {
-                    let dst = pixels.frame_mut();
-                    let n = dst.len().min(frame.rgba.len());
-                    dst[..n].copy_from_slice(&frame.rgba[..n]);
-                    if let Err(e) = pixels.render() {
-                        tracing::warn!(error = %e, "pixels render failed");
-                    } else {
-                        self.stats.frames_presented += 1;
-                        // Glass-to-glass: time from host capture to client
-                        // present. host and client must share a clock for
-                        // the absolute number to be meaningful — fine on
-                        // localhost (M5 target); for cross-machine M4+
-                        // testing rely on Tailscale + NTP.
-                        let now_us = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as u64)
-                            .unwrap_or(0);
-                        let delta = now_us.saturating_sub(frame.timestamp_us);
-                        self.stats.last_glass_to_glass_us = Some(delta);
-                        self.stats.cumulative_min_us =
-                            self.stats.cumulative_min_us.min(delta);
-                        self.stats.cumulative_max_us =
-                            self.stats.cumulative_max_us.max(delta);
-                        self.stats.cumulative_sum_us =
-                            self.stats.cumulative_sum_us.saturating_add(delta);
-                        self.stats.cumulative_samples += 1;
-                        if let Some(snap) = self.latency_tracker.record(delta) {
-                            tracing::info!(
-                                count = snap.count,
-                                min_us = snap.min_us,
-                                p50_us = snap.p50_us,
-                                p95_us = snap.p95_us,
-                                p99_us = snap.p99_us,
-                                max_us = snap.max_us,
-                                avg_us = snap.avg_us,
-                                "glass-to-glass latency window"
-                            );
-                        }
+                    self.show_debug = !self.show_debug;
+                    tracing::info!(show_debug = self.show_debug, "debug overlay toggled");
+                    if let Some(window) = self.window {
+                        window.request_redraw();
                     }
                 }
             }
+            WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(size) => {
                 if let Some(pixels) = self.pixels.as_mut() {
                     let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
@@ -236,10 +243,17 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Frame(frame) => {
+                // Track recent encoded sizes for the bitrate readout.
+                let now = Instant::now();
+                self.bitrate_window.push_back((now, frame.encoded_bytes));
+                self.trim_overlay_window(now);
                 self.last_frame = Some(frame);
                 if let Some(window) = self.window {
                     window.request_redraw();
                 }
+            }
+            UserEvent::DecoderReady { backend } => {
+                self.backend = Some(backend);
             }
             UserEvent::WorkerExited => {
                 tracing::info!("worker exited; closing display");
@@ -247,6 +261,129 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
             }
         }
     }
+}
+
+impl DisplayApp {
+    fn redraw(&mut self) {
+        // Take both the frame and pixels, run the present, then track
+        // latency. Split borrows here let us call `render_overlay` which
+        // borrows `&self`.
+        let Some(pixels) = self.pixels.as_mut() else {
+            return;
+        };
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let dst = pixels.frame_mut();
+        let n = dst.len().min(frame.rgba.len());
+        dst[..n].copy_from_slice(&frame.rgba[..n]);
+
+        if self.show_debug {
+            // Render text directly into the pixels framebuffer before
+            // pixels.render() copies it to the GPU.
+            render_overlay(
+                dst,
+                self.config.width,
+                self.config.height,
+                &OverlayState {
+                    backend: self.backend,
+                    frames_presented: self.stats.frames_presented + 1, // about to present
+                    last_lag_us: self.stats.last_lag_us,
+                    last_snapshot: self.last_snapshot,
+                    fps: estimate_fps(&self.present_window),
+                    bitrate_bps: estimate_bitrate_bps(&self.bitrate_window),
+                    show_hint: !self.show_debug, // unused; placeholder
+                },
+            );
+        }
+
+        if let Err(e) = pixels.render() {
+            tracing::warn!(error = %e, "pixels render failed");
+            return;
+        }
+
+        // Stats post-present. Lag = (now - first_packet_instant) — uses
+        // monotonic Instant so cross-machine clock skew is irrelevant.
+        let now = Instant::now();
+        self.present_window.push_back(now);
+        self.trim_overlay_window(now);
+        self.stats.frames_presented += 1;
+        if let Some(first) = self.last_frame.as_ref().map(|f| f.first_packet_instant) {
+            let delta = now.saturating_duration_since(first).as_micros();
+            #[allow(clippy::cast_possible_truncation)]
+            let delta_us = delta.min(u64::MAX as u128) as u64;
+            self.stats.last_lag_us = Some(delta_us);
+            self.stats.cumulative_min_us = self.stats.cumulative_min_us.min(delta_us);
+            self.stats.cumulative_max_us = self.stats.cumulative_max_us.max(delta_us);
+            self.stats.cumulative_sum_us = self.stats.cumulative_sum_us.saturating_add(delta_us);
+            self.stats.cumulative_samples += 1;
+            if let Some(snap) = self.latency_tracker.record(delta_us) {
+                tracing::info!(
+                    count = snap.count,
+                    min_us = snap.min_us,
+                    p50_us = snap.p50_us,
+                    p95_us = snap.p95_us,
+                    p99_us = snap.p99_us,
+                    max_us = snap.max_us,
+                    avg_us = snap.avg_us,
+                    "client lag window"
+                );
+                self.last_snapshot = Some(snap);
+            }
+        }
+    }
+
+    fn trim_overlay_window(&mut self, now: Instant) {
+        while let Some(&t) = self.present_window.front() {
+            if now.duration_since(t) > OVERLAY_WINDOW {
+                self.present_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        while let Some(&(t, _)) = self.bitrate_window.front() {
+            if now.duration_since(t) > OVERLAY_WINDOW {
+                self.bitrate_window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn estimate_fps(window: &VecDeque<Instant>) -> f64 {
+    if window.len() < 2 {
+        return 0.0;
+    }
+    let span = window
+        .back()
+        .unwrap()
+        .duration_since(*window.front().unwrap())
+        .as_secs_f64();
+    if span <= 0.0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let n = (window.len() - 1) as f64;
+    n / span
+}
+
+fn estimate_bitrate_bps(window: &VecDeque<(Instant, usize)>) -> f64 {
+    if window.len() < 2 {
+        return 0.0;
+    }
+    let span = window
+        .back()
+        .unwrap()
+        .0
+        .duration_since(window.front().unwrap().0)
+        .as_secs_f64();
+    if span <= 0.0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let total_bytes = window.iter().map(|(_, n)| *n).sum::<usize>() as f64;
+    total_bytes * 8.0 / span
 }
 
 /// Build the winit event loop. Returns the loop together with a proxy that
@@ -257,4 +394,158 @@ pub fn build_event_loop() -> Result<(EventLoop<UserEvent>, EventLoopProxy<UserEv
         .context("building winit event loop")?;
     let proxy = event_loop.create_proxy();
     Ok((event_loop, proxy))
+}
+
+// ============================================================================
+// Debug overlay rendering
+// ============================================================================
+
+struct OverlayState {
+    backend: Option<&'static str>,
+    frames_presented: u64,
+    last_lag_us: Option<u64>,
+    last_snapshot: Option<LatencySnapshot>,
+    fps: f64,
+    bitrate_bps: f64,
+    #[allow(dead_code)]
+    show_hint: bool,
+}
+
+const OVERLAY_SCALE: usize = 2;
+const OVERLAY_PAD: usize = 6;
+const OVERLAY_LINE_GAP: usize = 2;
+const OVERLAY_BG: [u8; 4] = [0, 0, 0, 220];
+const OVERLAY_FG: [u8; 4] = [240, 240, 240, 255];
+const OVERLAY_DIM: [u8; 4] = [160, 160, 160, 255];
+
+fn render_overlay(buf: &mut [u8], width: u32, height: u32, st: &OverlayState) {
+    let lines = build_lines(st);
+    let max_chars = lines.iter().map(|(s, _)| s.chars().count()).max().unwrap_or(0);
+
+    let line_h = 8 * OVERLAY_SCALE + OVERLAY_LINE_GAP;
+    let panel_w = max_chars * 8 * OVERLAY_SCALE + 2 * OVERLAY_PAD;
+    let panel_h = lines.len() * line_h + 2 * OVERLAY_PAD;
+    let panel_x = 8;
+    let panel_y = 8;
+
+    let w = width as usize;
+    let h = height as usize;
+
+    fill_rect(buf, w, h, panel_x, panel_y, panel_w, panel_h, OVERLAY_BG);
+
+    for (i, (text, color)) in lines.iter().enumerate() {
+        let y = panel_y + OVERLAY_PAD + i * line_h;
+        draw_text(
+            buf,
+            w,
+            h,
+            panel_x + OVERLAY_PAD,
+            y,
+            OVERLAY_SCALE,
+            text,
+            *color,
+        );
+    }
+}
+
+fn build_lines(st: &OverlayState) -> Vec<(String, [u8; 4])> {
+    let mut lines: Vec<(String, [u8; 4])> = Vec::new();
+    lines.push(("mush-stream  Ctrl+Alt+D".to_owned(), OVERLAY_DIM));
+    lines.push((
+        format!("backend  {}", st.backend.unwrap_or("?")),
+        OVERLAY_FG,
+    ));
+    lines.push((format!("frames   {}", st.frames_presented), OVERLAY_FG));
+    lines.push((format!("fps      {:.1}", st.fps), OVERLAY_FG));
+    lines.push((
+        format!("rx Mbps  {:.2}", st.bitrate_bps / 1_000_000.0),
+        OVERLAY_FG,
+    ));
+    if let Some(us) = st.last_lag_us {
+        lines.push((format!("lag ms   {}", us / 1000), OVERLAY_FG));
+    } else {
+        lines.push(("lag ms   -".to_owned(), OVERLAY_DIM));
+    }
+    if let Some(s) = st.last_snapshot {
+        lines.push((
+            format!(
+                "p50/95/99/max ms  {}/{}/{}/{}",
+                s.p50_us / 1000,
+                s.p95_us / 1000,
+                s.p99_us / 1000,
+                s.max_us / 1000,
+            ),
+            OVERLAY_FG,
+        ));
+    } else {
+        lines.push(("p50/95/99/max ms  -".to_owned(), OVERLAY_DIM));
+    }
+    lines
+}
+
+#[allow(clippy::too_many_arguments)] // small overlay helper; struct would be churn
+fn fill_rect(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    rw: usize,
+    rh: usize,
+    color: [u8; 4],
+) {
+    let x_end = (x + rw).min(w);
+    let y_end = (y + rh).min(h);
+    for py in y..y_end {
+        let row_off = py * w * 4;
+        for px in x..x_end {
+            let off = row_off + px * 4;
+            // Bounds-checked once per row entry — `dst.copy_from_slice`
+            // would also work but feels heavier than 4 byte writes.
+            buf[off] = color[0];
+            buf[off + 1] = color[1];
+            buf[off + 2] = color[2];
+            buf[off + 3] = color[3];
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // small overlay helper; struct would be churn
+fn draw_text(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    scale: usize,
+    text: &str,
+    fg: [u8; 4],
+) {
+    for (i, ch) in text.chars().enumerate() {
+        let glyph = font8x8::BASIC_FONTS.get(ch).unwrap_or([0u8; 8]);
+        let glyph_origin_x = x + i * 8 * scale;
+        for (gy, row) in glyph.iter().enumerate() {
+            for gx in 0..8 {
+                if (row >> gx) & 1 == 0 {
+                    continue;
+                }
+                let cell_x = glyph_origin_x + gx * scale;
+                let cell_y = y + gy * scale;
+                for sx in 0..scale {
+                    for sy in 0..scale {
+                        let dx = cell_x + sx;
+                        let dy = cell_y + sy;
+                        if dx >= w || dy >= h {
+                            continue;
+                        }
+                        let off = (dy * w + dx) * 4;
+                        buf[off] = fg[0];
+                        buf[off + 1] = fg[1];
+                        buf[off + 2] = fg[2];
+                        buf[off + 3] = fg[3];
+                    }
+                }
+            }
+        }
+    }
 }
