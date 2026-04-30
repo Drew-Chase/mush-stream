@@ -8,6 +8,7 @@ pub mod audio;
 pub mod capture;
 pub mod config;
 pub mod encode;
+pub mod runner;
 pub mod transport;
 pub mod upnp;
 pub mod vigem;
