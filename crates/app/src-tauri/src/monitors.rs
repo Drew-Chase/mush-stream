@@ -3,14 +3,14 @@
 
 use base64::engine::general_purpose;
 use base64::Engine;
-use mush_stream_host::capture::{CaptureError, CaptureRect, Capturer};
 use serde::Serialize;
 use tauri::async_runtime;
 
 /// Width the screenshot is downscaled to before PNG-encoding. The
-/// preview area is at most ~800px wide on the Host page; anything
-/// larger just wastes bytes on the wire and CPU on the encoder.
-const SCREENSHOT_TARGET_WIDTH: u32 = 960;
+/// preview area is at most ~800px wide on the Host page, and the
+/// frontend polls at 1 Hz, so smaller is better — 640 keeps each
+/// frame under ~80 KB on the wire while still looking sharp.
+const SCREENSHOT_TARGET_WIDTH: u32 = 640;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,29 +109,26 @@ fn blocking_list() -> anyhow::Result<Vec<MonitorInfo>> {
 }
 
 fn blocking_screenshot(index: u32) -> Result<MonitorScreenshot, anyhow::Error> {
-    // Discover the monitor's full pixel dimensions so we capture the
-    // entire surface (the user's saved capture rect may be smaller).
+    // Discover the monitor's virtual-desktop position + dimensions.
+    // We use GDI BitBlt against the global screen DC rather than
+    // DXGI Desktop Duplication: DXGI only delivers frames when the
+    // compositor reports a change, so a static screen yields a
+    // black/timed-out result. GDI reads the framebuffer directly
+    // and always produces a valid snapshot regardless of activity.
     let monitors = blocking_list()?;
     let Some(monitor) = monitors.iter().find(|m| m.index == index) else {
         return Err(anyhow::anyhow!("monitor {index} not found"));
     };
 
-    let rect = CaptureRect {
-        x: 0,
-        y: 0,
-        width: monitor.width,
-        height: monitor.height,
-    };
-    let mut capturer = Capturer::new(index, rect)
-        .map_err(|e: CaptureError| anyhow::anyhow!("Capturer::new: {e}"))?;
-    // Up to 60 attempts × 16ms = ~1s — enough for DXGI Desktop
-    // Duplication to ramp on the first frame after a fresh open.
-    let bgra = capturer
-        .next_frame_bgra(60)
-        .map_err(|e| anyhow::anyhow!("next_frame_bgra: {e}"))?;
+    let bgra = gdi_capture_region(
+        monitor.virtual_x,
+        monitor.virtual_y,
+        monitor.width,
+        monitor.height,
+    )?;
 
     let (out_w, out_h, rgba) = downscale_bgra_to_rgba(
-        bgra,
+        &bgra,
         monitor.width,
         monitor.height,
         SCREENSHOT_TARGET_WIDTH,
@@ -143,6 +140,118 @@ fn blocking_screenshot(index: u32) -> Result<MonitorScreenshot, anyhow::Error> {
         height: monitor.height,
         data_url: format!("data:image/png;base64,{b64}"),
     })
+}
+
+/// GDI BitBlt screenshot of a region of the virtual desktop. Returns
+/// a BGRA buffer (width × height × 4) ready for the rest of the
+/// pipeline. All HDC/HBITMAP handles are released before return; on
+/// any failure we still walk the cleanup path.
+///
+/// Width/height come in as `u32` from the DXGI desc; we cast to `i32`
+/// for the GDI APIs. Realistic monitor dimensions (≤ 8K) fit safely;
+/// the cast can't actually wrap.
+#[cfg(windows)]
+#[allow(clippy::cast_possible_wrap)]
+fn gdi_capture_region(
+    virtual_x: i32,
+    virtual_y: i32,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Vec<u8>> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
+        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SRCCOPY, SelectObject,
+    };
+
+    if width == 0 || height == 0 {
+        return Err(anyhow::anyhow!("invalid screenshot region {width}x{height}"));
+    }
+
+    // SAFETY: every handle returned by GDI is freed before this
+    // function returns; calls are single-threaded and have no
+    // overlapping aliases.
+    unsafe {
+        let screen_dc = GetDC(HWND::default());
+        if screen_dc.is_invalid() {
+            return Err(anyhow::anyhow!("GetDC(None) returned NULL"));
+        }
+        let result = (|| -> anyhow::Result<Vec<u8>> {
+            let mem_dc = CreateCompatibleDC(screen_dc);
+            if mem_dc.is_invalid() {
+                return Err(anyhow::anyhow!("CreateCompatibleDC failed"));
+            }
+            let bitmap = CreateCompatibleBitmap(screen_dc, width as i32, height as i32);
+            if bitmap.is_invalid() {
+                let _ = DeleteDC(mem_dc);
+                return Err(anyhow::anyhow!("CreateCompatibleBitmap failed"));
+            }
+            let prev = SelectObject(mem_dc, bitmap);
+
+            BitBlt(
+                mem_dc,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                screen_dc,
+                virtual_x,
+                virtual_y,
+                SRCCOPY,
+            )
+            .map_err(|e| anyhow::anyhow!("BitBlt: {e}"))?;
+
+            // Negative biHeight asks GetDIBits for top-down rows so
+            // the BGRA buffer can be sliced row-by-row without an
+            // extra vertical flip.
+            let mut bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width as i32,
+                    biHeight: -(height as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
+            let scanlines = GetDIBits(
+                mem_dc,
+                bitmap,
+                0,
+                height,
+                Some(buf.as_mut_ptr().cast()),
+                &raw mut bmi,
+                DIB_RGB_COLORS,
+            );
+            if scanlines == 0 {
+                let _ = SelectObject(mem_dc, prev);
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(mem_dc);
+                return Err(anyhow::anyhow!("GetDIBits returned 0 scanlines"));
+            }
+
+            let _ = SelectObject(mem_dc, prev);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(mem_dc);
+            Ok(buf)
+        })();
+        ReleaseDC(HWND::default(), screen_dc);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+fn gdi_capture_region(
+    _virtual_x: i32,
+    _virtual_y: i32,
+    _width: u32,
+    _height: u32,
+) -> anyhow::Result<Vec<u8>> {
+    Err(anyhow::anyhow!("screenshot is only implemented on Windows"))
 }
 
 /// Nearest-neighbor downscale of a BGRA buffer to an RGBA buffer

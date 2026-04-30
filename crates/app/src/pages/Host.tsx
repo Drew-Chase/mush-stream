@@ -118,29 +118,46 @@ export default function Host() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Refresh the screenshot whenever the selected monitor changes.
+  // Live monitor preview: poll the screenshot endpoint at 1 Hz while
+  // the page is mounted. Skips overlapping calls so a slow capture
+  // can't pile up requests, and stops polling while the host
+  // pipeline is broadcasting (DXGI Desktop Duplication is exclusive
+  // to the running encoder; GDI is fine but the preview is moot
+  // when the marquee is locked anyway). Refreshes immediately when
+  // the user switches monitors.
   useEffect(() => {
     if (monitor === undefined) return;
     let cancelled = false;
-    setShotLoading(true);
-    setShotError(null);
-    void (async () => {
+    let inFlight = false;
+    let firstShot = true;
+
+    const tick = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      if (firstShot) setShotLoading(true);
       try {
         const shot = await monitorScreenshot(monitor.index);
-        if (!cancelled) setScreenshot(shot);
-      } catch (e) {
         if (!cancelled) {
-          setShotError(String(e));
-          setScreenshot(null);
+          setScreenshot(shot);
+          setShotError(null);
         }
+      } catch (e) {
+        if (!cancelled) setShotError(String(e));
       } finally {
-        if (!cancelled) setShotLoading(false);
+        if (!cancelled && firstShot) setShotLoading(false);
+        firstShot = false;
+        inFlight = false;
       }
-    })();
+    };
+
+    void tick();
+    const intervalMs = live ? 0 : 1000;
+    const id = intervalMs > 0 ? window.setInterval(tick, intervalMs) : null;
     return () => {
       cancelled = true;
+      if (id !== null) window.clearInterval(id);
     };
-  }, [monitor?.index]);
+  }, [monitor?.index, live]);
 
   // Visual-only telemetry while broadcasting.
   const fps = useRolling(() => 58 + Math.random() * 3);
@@ -287,6 +304,7 @@ export default function Host() {
 
   return (
     <div className="screen">
+      <div className="hostpage">
       <div className="pgheader">
         <div>
           <div className="eyebrow">
@@ -677,6 +695,7 @@ export default function Host() {
             </div>
           </div>
         </Card>
+      </div>
       </div>
     </div>
   );
