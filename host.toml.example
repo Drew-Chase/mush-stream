@@ -14,22 +14,23 @@ width = 2560
 height = 1440
 
 [network]
-# UDP socket the host binds for sending video to the client.
-video_bind = "0.0.0.0:9001"
-# UDP socket the host binds for receiving gamepad input from the client.
-input_bind = "0.0.0.0:9002"
-# The client's video receive address (typically a Tailscale IP).
-peer = "100.64.0.2:9001"
-# When true, the host attempts to forward `input_bind`'s UDP port through
-# the local router via UPnP at startup, so a remote client can reach you
-# without manual port forwarding. Only flip on if you're not on Tailscale
-# (or another VPN); router must have UPnP enabled.
+# UDP port the host listens on. Clients put this in their `host` config.
+# The host learns each client's address from the first packet it
+# receives, so no peer/address goes here — the local IP is implicit.
+listen_port = 9002
+# When true, ask the local router to forward `listen_port` via UPnP at
+# startup so a client across NAT can reach this host without manual
+# port forwarding.
 enable_upnp = false
 
 [encode]
-# H.264 NVENC target bitrate in kbps. 20 Mbps is a reasonable LAN/Tailscale default.
-bitrate_kbps = 20000
-# Capture/encode framerate. Match (or be a divisor of) the host's display
-# refresh rate. DXGI delivers frames at the display's refresh; setting fps
-# higher than that won't produce more real frames.
+# H.264 NVENC target bitrate in kbps. 9 Mbps is the default — paired
+# with the encoder's preset=p4 + spatial-aq + multipass=qres tuning,
+# this gives clean output at 1440p60 over a typical home upload link.
+# Bump higher if you have headroom and want more detail; the encoder
+# is configured CBR so it'll fill whatever you give it.
+bitrate_kbps = 9000
+# Capture/encode framerate. Match (or be a divisor of) the host's
+# display refresh rate. DXGI delivers frames at the display's refresh;
+# setting fps higher than that won't produce more real frames.
 fps = 60

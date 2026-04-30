@@ -4,17 +4,11 @@
 # default; pass a path as the first CLI arg to override.
 
 [network]
-# UDP socket the client binds to receive video from the host. Must match
-# the host's [network] peer address.
-video_bind = "0.0.0.0:9001"
-# Address of the host's input/control listener (typically a Tailscale IP).
-# Must match the host's [network] input_bind from the host's perspective.
-host_input_addr = "100.64.0.1:9002"
-# When true, the client attempts to forward `video_bind`'s UDP port
-# through the local router via UPnP at startup, so the host can reach
-# you without manual port forwarding. Only flip on if you're not on
-# Tailscale (or another VPN); router must have UPnP enabled.
-enable_upnp = false
+# Host's UDP address — the only thing this client needs to know about
+# the network. The client connects its UDP socket here; the host learns
+# the client's address from that first packet (UDP hole-punch) and
+# starts sending video back.
+host = "192.168.1.100:9002"
 
 [display]
 # Pixel buffer dimensions. Match the host's capture rect to avoid scaling.
@@ -25,6 +19,6 @@ fullscreen = false
 
 [decode]
 # Try h264_cuvid first; if it fails to initialize, fall back to the
-# bundled software h264 decoder. Set false if you're sure you don't have
-# an NVIDIA GPU (skips the failed-open warning).
+# bundled software h264 decoder. Set false if you're sure you don't
+# have an NVIDIA GPU (skips the failed-open warning).
 prefer_hardware = true
