@@ -20,6 +20,17 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",
+    # Audio capture (WASAPI loopback + per-process loopback) + COM init
+    # + process enumeration for the per-app blacklist.
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Variant",
 ] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1.2+spec-1.1.0"
@@ -46,6 +57,11 @@ socket2 = "0.6"
 # Public-domain 8x8 bitmap font used by the client's debug overlay so we
 # don't have to ship a TTF or pull in a full text-rasterization stack.
 font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
+# Audio playback on the client. cpal abstracts WASAPI on Windows for the
+# render side and gives us a simple "default output device" path; the
+# capture side is direct-WASAPI on the host because cpal doesn't expose
+# the per-process loopback API we need for the blacklist.
+cpal = "0.16"
 
 # For automatic portforwarding
 upnpc-rs = { git = "https://github.com/Drew-Chase/upnpc-rs.git" }

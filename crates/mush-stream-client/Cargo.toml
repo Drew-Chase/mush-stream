@@ -23,6 +23,7 @@ reed-solomon-erasure = { workspace = true }
 clap = { workspace = true }
 socket2 = { workspace = true }
 font8x8 = { workspace = true }
+cpal = { workspace = true }
 
 [lints]
 workspace = true
