@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Select, SelectItem } from "@heroui/react";
 import { IcMonitor } from "../../components/Icons";
 import { Card, Tag } from "../../components/primitives";
 import { useHosting } from "../../hosting";
@@ -230,22 +231,41 @@ export default function CaptureRegionCard({
         </span>
         <div className="cardhd__r">
           {monitors.length > 0 ? (
-            <select
-              className="monitor-select"
-              value={cfg.capture.output_index}
-              onChange={(e) =>
-                updateCapture({ output_index: +e.target.value })
-              }
-              disabled={!interactive}
+            <Select
+              size="sm"
+              variant="bordered"
               aria-label="Capture monitor"
+              isDisabled={!interactive}
+              selectedKeys={[String(cfg.capture.output_index)]}
+              onSelectionChange={(keys) => {
+                const first = Array.from(keys)[0];
+                const idx = Number(first);
+                if (!Number.isNaN(idx)) {
+                  updateCapture({ output_index: idx });
+                }
+              }}
+              className="cardhd__select"
+              classNames={{
+                trigger: "cardhd__select-trigger",
+                value: "cardhd__select-value",
+                popoverContent: "cardhd__select-popover",
+              }}
+              renderValue={(items) =>
+                items.map((item) => (
+                  <span key={item.key}>{item.textValue}</span>
+                ))
+              }
             >
               {monitors.map((m) => (
-                <option key={m.index} value={m.index}>
+                <SelectItem
+                  key={String(m.index)}
+                  textValue={`${m.name}${m.primary ? " · primary" : ""}`}
+                >
                   {m.name}
                   {m.primary ? " · primary" : ""}
-                </option>
+                </SelectItem>
               ))}
-            </select>
+            </Select>
           ) : (
             <Tag>{monitorTagLabel}</Tag>
           )}
@@ -255,7 +275,15 @@ export default function CaptureRegionCard({
           <Tag>{cfg.encode.fps} fps</Tag>
         </div>
       </div>
-      <div className="pv" ref={pvRef}>
+      <div
+        className="pv"
+        ref={pvRef}
+        style={
+          monitor
+            ? { aspectRatio: `${monitor.width} / ${monitor.height}` }
+            : undefined
+        }
+      >
         {screenshot ? (
           <img
             src={screenshot.dataUrl}
