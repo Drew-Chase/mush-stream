@@ -187,19 +187,51 @@ fn run_decode_loop(
     let mut event_loop_alive = true;
     let mut decoded_frames: u64 = 0;
     let mut decode_errors: u64 = 0;
+    let mut fast_forward_events: u64 = 0;
+    let mut fast_forward_frames: u64 = 0;
 
-    while let Some(delivered) = frame_rx.blocking_recv() {
+    while let Some(first) = frame_rx.blocking_recv() {
         if !event_loop_alive {
             // No point decoding if there's no one to draw it.
             break;
         }
-        let proxy_clone = proxy.clone();
-        let mut alive = event_loop_alive;
+
+        // Drain anything else already pending. If the decoder/render side
+        // briefly stalled (GPU contention, OS scheduling, wgpu present
+        // hiccup) the channel can have multiple frames queued — we'd
+        // otherwise present them at vsync rate, which reads as slow-mo
+        // for the time it takes to drain. Instead: advance the reference
+        // chain by decode-without-present for everything except the
+        // newest frame, then full decode + scale + present that one.
+        let mut latest = first;
+        let mut skipped_bytes: usize = 0;
+        let mut skipped = 0u32;
+        while let Ok(extra) = frame_rx.try_recv() {
+            // Advance reference chain on the previous `latest`. Cheap:
+            // hardware decode without the YUV→RGBA scale_to_rgba step.
+            match decoder.decode_without_present(&latest.reassembled.nal) {
+                Ok(bytes) => skipped_bytes += bytes,
+                Err(e) => tracing::warn!(error = %e, "decode-without-present failed"),
+            }
+            latest = extra;
+            skipped += 1;
+        }
+        if skipped > 0 {
+            fast_forward_events += 1;
+            fast_forward_frames += u64::from(skipped);
+            tracing::debug!(skipped, "fast-forwarded backlog");
+        }
+
         let DeliveredFrame {
             reassembled,
             first_packet_instant,
-        } = delivered;
-        let res = decoder.push_nal(&reassembled.nal, first_packet_instant, |frame| {
+        } = latest;
+        let proxy_clone = proxy.clone();
+        let mut alive = event_loop_alive;
+        let res = decoder.push_nal(&reassembled.nal, first_packet_instant, |mut frame| {
+            // Lump the skipped frames' bytes into the presented frame so
+            // the overlay's bitrate readout stays accurate.
+            frame.encoded_bytes = frame.encoded_bytes.saturating_add(skipped_bytes);
             if alive && proxy_clone.send_event(UserEvent::Frame(frame)).is_err() {
                 alive = false;
             }
@@ -216,6 +248,12 @@ fn run_decode_loop(
 
     // Tell the event loop the worker is going away (no-op if already exited).
     let _ = proxy.send_event(UserEvent::WorkerExited);
-    tracing::info!(decoded_frames, decode_errors, "decode loop exiting");
+    tracing::info!(
+        decoded_frames,
+        decode_errors,
+        fast_forward_events,
+        fast_forward_frames,
+        "decode loop exiting"
+    );
     Ok(())
 }

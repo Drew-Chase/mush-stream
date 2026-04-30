@@ -154,6 +154,32 @@ impl VideoDecoder {
     /// May yield 0 or more decoded frames (SPS-only inputs yield nothing;
     /// at startup the decoder buffers a few frames before producing
     /// output).
+    /// Decode `nal` purely to advance the reference chain. The decoded
+    /// frame is *not* colour-converted or yielded to a caller — the
+    /// expensive [`Self::scale_to_rgba`] step is skipped entirely.
+    /// Returns the encoded byte count consumed so callers can keep
+    /// bitrate accounting accurate when fast-forwarding through a
+    /// backlog.
+    pub fn decode_without_present(&mut self, nal: &[u8]) -> Result<usize, DecodeError> {
+        let bytes = nal.len();
+        let packet = Packet::copy(nal);
+        self.decoder.send_packet(&packet).ff("send_packet")?;
+        let mut decoded = frame::Video::empty();
+        loop {
+            match self.decoder.receive_frame(&mut decoded) {
+                Ok(()) => { /* discard; we only want reference state */ }
+                Err(ffmpeg::Error::Eof | ffmpeg::Error::Other { .. }) => break,
+                Err(e) => {
+                    return Err(DecodeError::Ffmpeg {
+                        context: "receive_frame",
+                        source: e,
+                    });
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     pub fn push_nal<F>(
         &mut self,
         nal: &[u8],
