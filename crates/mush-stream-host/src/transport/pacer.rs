@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 /// Refills continuously at `refill_rate_bps` bytes per second, capped at
 /// `capacity_bytes`. [`Self::take`] awaits if the bucket lacks the
 /// requested tokens.
+///
+/// Internal token accounting uses `f64`; the precision loss when byte
+/// counts exceed 2^53 is harmless here since byte counts in this module
+/// stay in the kB-to-MB range.
 #[derive(Debug)]
 pub struct TokenBucket {
     capacity_bytes: f64,
@@ -25,6 +29,7 @@ pub struct TokenBucket {
     last_refill: Instant,
 }
 
+#[allow(clippy::cast_precision_loss)]
 impl TokenBucket {
     pub fn new(capacity_bytes: u64, refill_rate_bps: u64) -> Self {
         Self {

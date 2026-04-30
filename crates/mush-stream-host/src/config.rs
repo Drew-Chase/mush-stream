@@ -1,6 +1,6 @@
 //! TOML configuration loader for `mush-stream-host`.
 
-use std::{fs, net::SocketAddr, path::Path};
+use std::{fs, path::Path};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -8,9 +8,6 @@ use thiserror::Error;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub capture: CaptureConfig,
-    // `network` is loaded but unused until M3; declared now so the schema is
-    // stable across milestones.
-    #[allow(dead_code)]
     pub network: NetworkConfig,
     pub encode: EncodeConfig,
 }
@@ -26,16 +23,14 @@ pub struct CaptureConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct NetworkConfig {
-    pub video_bind: SocketAddr,
-    pub input_bind: SocketAddr,
-    pub peer: SocketAddr,
-    /// When true, attempt to forward `input_bind`'s UDP port through the
-    /// local router via UPnP at startup, so a remote client can reach
-    /// us without manual port forwarding. Defaults to false (matching
-    /// the spec's "use Tailscale, no NAT traversal" stance — flip on
-    /// only if you're not behind a VPN).
+    /// UDP port the host listens on. Clients send their input/control
+    /// packets here (and the first one announces them as the peer the
+    /// host should send video to).
+    pub listen_port: u16,
+    /// When true, attempt to forward `listen_port` through the local
+    /// router via UPnP at startup so a remote client can reach this
+    /// host without manual port forwarding.
     #[serde(default)]
     pub enable_upnp: bool,
 }

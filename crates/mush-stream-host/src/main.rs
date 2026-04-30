@@ -33,7 +33,7 @@ use tracing_subscriber::EnvFilter;
 use crate::capture::{CaptureError, CaptureRect, Capturer};
 use crate::config::Config;
 use crate::encode::{Mp4Recorder, VideoEncoder};
-use crate::transport::{run_input_receiver, run_video_sender, VIDEO_SEND_CHANNEL};
+use crate::transport::{run_host_socket, VIDEO_SEND_CHANNEL};
 use crate::upnp::UpnpForward;
 use crate::vigem::VirtualGamepad;
 
@@ -41,6 +41,14 @@ const PNG_OUTPUT_PATH: &str = "./capture-debug.png";
 const MP4_OUTPUT_PATH: &str = "./capture-debug.mp4";
 const FIRST_FRAME_MAX_ATTEMPTS: u32 = 60;
 const RECORD_SECONDS: u32 = 5;
+
+/// Reed-Solomon parity ratio applied per frame. 0.10 = ~10% extra parity
+/// packets; any single-packet drop in a frame is recoverable on the
+/// receive side without waiting for a re-keyframe. The wire overhead is
+/// higher than 10% (parity pads every data packet to `MAX_PAYLOAD`), but
+/// for low-latency streaming the bandwidth cost beats the visible
+/// corruption from un-recovered loss. Set to 0.0 here to disable.
+const FEC_PARITY_RATIO: f32 = 0.10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -182,12 +190,13 @@ fn record_to_mp4(
 }
 
 /// M4+: capture+encode → UDP stream to peer. Runs until Ctrl+C.
+#[allow(clippy::needless_pass_by_value)] // owns config + rect for the runtime lifetime
 fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
-    // Optional UPnP port forwarding for the input/control listener so a
-    // remote client behind NAT can reach the host without manual port
+    // Optional UPnP port forwarding for the listen socket so a remote
+    // client behind NAT can reach the host without manual port
     // forwarding. Held for the lifetime of `run_stream`; Drop unmaps.
     let _upnp_guard = if cfg.network.enable_upnp {
-        UpnpForward::try_forward_udp(cfg.network.input_bind.port(), "mush-stream-host input")
+        UpnpForward::try_forward_udp(cfg.network.listen_port, "mush-stream-host")
     } else {
         None
     };
@@ -205,25 +214,17 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
         let (gamepad_tx, gamepad_rx) = std::sync::mpsc::sync_channel::<InputPacket>(256);
         let (control_tx, control_rx) = std::sync::mpsc::sync_channel::<ControlMessage>(64);
 
-        let video_bind = cfg.network.video_bind;
-        let peer = cfg.network.peer;
-        let input_bind = cfg.network.input_bind;
+        let listen_port = cfg.network.listen_port;
         // 1.25× headroom over the encoder's target so the pacer doesn't
         // stall the queue if NVENC briefly overshoots.
         let pacer_bps = (u64::from(cfg.encode.bitrate_kbps) * 1000 / 8) * 5 / 4;
 
-        // UDP send task.
-        let sender = tokio::spawn(async move {
-            match run_video_sender(video_bind, peer, datagram_rx, pacer_bps).await {
-                Ok(stats) => tracing::info!(?stats, "video sender stopped"),
-                Err(e) => tracing::error!(error = %e, "video sender failed"),
-            }
-        });
-
-        // UDP input/control receive task.
-        let receiver = tokio::spawn(async move {
-            if let Err(e) = run_input_receiver(input_bind, inbound_tx).await {
-                tracing::error!(error = %e, "input receiver failed");
+        // Unified host socket: send video to discovered peer, receive
+        // input/control from same socket.
+        let host_sock = tokio::spawn(async move {
+            match run_host_socket(listen_port, datagram_rx, inbound_tx, pacer_bps).await {
+                Ok(stats) => tracing::info!(?stats, "host socket stopped"),
+                Err(e) => tracing::error!(error = %e, "host socket failed"),
             }
         });
 
@@ -295,8 +296,7 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
             let _ = vigem_handle.join();
         })
         .await;
-        sender.abort();
-        receiver.abort();
+        host_sock.abort();
         inbound_handle.abort();
 
         anyhow::Ok(())
@@ -304,6 +304,8 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
 }
 
 /// The synchronous capture+encode hot loop, run in a dedicated thread.
+#[allow(clippy::needless_pass_by_value)] // long-running thread entry; owns its inputs
+#[allow(clippy::too_many_lines)] // single coherent loop; refactor would scatter state
 fn run_capture_encode_loop(
     output_index: u32,
     rect: CaptureRect,
@@ -325,6 +327,14 @@ fn run_capture_encode_loop(
     let mut pts: i64 = 0;
     let mut dropped_full_channel: u64 = 0;
     let mut keyframes_forced: u64 = 0;
+
+    // Cap the capture+encode rate to the configured fps. DXGI Desktop
+    // Duplication delivers frames at the host's monitor refresh (often
+    // 144/165/240 Hz on a gaming rig); without this the encoder is fed
+    // 2-4x faster than its time_base assumes, which scrambles NVENC's
+    // bit-budget controller and the decoder produces broken references.
+    let frame_interval = std::time::Duration::from_micros(1_000_000 / u64::from(fps));
+    let mut next_deadline = std::time::Instant::now() + frame_interval;
 
     while !shutdown.load(Ordering::Acquire) {
         // Drain pending control messages before encoding the next frame.
@@ -365,24 +375,40 @@ fn run_capture_encode_loop(
 
         encoder
             .push_bgra(&last_frame, pts, |packet| {
-                let nal = match packet.data() {
-                    Some(d) => d,
-                    None => return Ok(()),
+                let Some(nal) = packet.data() else {
+                    return Ok(());
                 };
                 let is_keyframe = packet
                     .flags()
                     .contains(ffmpeg_the_third::codec::packet::Flags::KEY);
-                framer.frame(nal, timestamp_us, is_keyframe, |datagram| {
+                let emit = |datagram: &[u8]| {
                     match datagram_tx.try_send(datagram.to_vec()) {
-                        Ok(()) => {}
+                        // Closed: network task gone, nothing more we can
+                        // do — same path as Ok at this layer.
+                        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             dropped_full_channel += 1;
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            // Network task is gone; nothing more we can do.
-                        }
                     }
-                });
+                };
+                if FEC_PARITY_RATIO > 0.0 {
+                    if let Err(e) = framer.frame_with_fec(
+                        nal,
+                        timestamp_us,
+                        is_keyframe,
+                        FEC_PARITY_RATIO,
+                        emit,
+                    ) {
+                        // RS rejects N+K > 256 (galois_8). Falling back
+                        // would need framer to be re-borrowed in this
+                        // closure — easier to just log and let the next
+                        // frame come through; the client will request a
+                        // keyframe on the resulting gap.
+                        tracing::warn!(error = %e, "FEC framing failed; frame dropped");
+                    }
+                } else {
+                    framer.frame(nal, timestamp_us, is_keyframe, emit);
+                }
                 Ok(())
             })
             .with_context(|| format!("encoding frame pts={pts}"))?;
@@ -394,6 +420,18 @@ fn run_capture_encode_loop(
                 dropped_full_channel,
                 "..."
             );
+        }
+
+        // Pace to the configured fps. Sleep until the next frame's
+        // deadline; if we fell behind (long encode, GC, scheduling), reset
+        // so we don't burst-catch-up.
+        let now = std::time::Instant::now();
+        if now < next_deadline {
+            std::thread::sleep(next_deadline - now);
+        }
+        next_deadline += frame_interval;
+        if next_deadline < std::time::Instant::now() {
+            next_deadline = std::time::Instant::now() + frame_interval;
         }
     }
 
@@ -422,6 +460,7 @@ fn run_capture_encode_loop(
 
 /// Drains the gamepad input channel, applying each packet to the virtual
 /// Xbox 360. Connects lazily; if ViGEm isn't available we log and exit.
+#[allow(clippy::needless_pass_by_value)] // long-running thread entry; owns its receiver
 fn run_vigem_loop(rx: std::sync::mpsc::Receiver<InputPacket>) {
     let mut pad = match VirtualGamepad::connect() {
         Ok(p) => p,
