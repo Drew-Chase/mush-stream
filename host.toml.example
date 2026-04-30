@@ -34,3 +34,20 @@ bitrate_kbps = 9000
 # display refresh rate. DXGI delivers frames at the display's refresh;
 # setting fps higher than that won't produce more real frames.
 fps = 60
+
+[audio]
+# Stream system audio alongside video. Set false to disable the audio
+# path entirely.
+enabled = true
+# Opus target bitrate in kbps. 96 kbps stereo is transparent for game
+# soundtracks and voice; bump if you really want lossless-feel audio.
+bitrate_kbps = 96
+# Process names whose audio the host should exclude from the captured
+# mix. Case-insensitive; `.exe` optional. Common entries: "discord.exe",
+# "chrome.exe", "firefox.exe". `discord.exe` is in the default so voice
+# chat doesn't get re-streamed to the remote viewer.
+# When the blacklist is non-empty the host switches from a single
+# system-mix loopback to a per-process WASAPI loopback per non-
+# blacklisted session and software-mixes them. Run the host with
+# `--list-audio-sessions` to discover process names to add here.
+blacklist = ["discord.exe"]

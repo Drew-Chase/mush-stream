@@ -31,7 +31,13 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_Variant",
+    # Required to implement IActivateAudioInterfaceCompletionHandler for
+    # the per-process loopback activation completion callback.
+    "implement",
 ] }
+# `#[implement]` macro generates `::windows_core::...` paths, so the
+# crate has to be a direct dependency in addition to the umbrella crate.
+windows-core = "0.58"
 serde = { version = "1", features = ["derive"] }
 toml = "1.1.2+spec-1.1.0"
 thiserror = "2.0.18"

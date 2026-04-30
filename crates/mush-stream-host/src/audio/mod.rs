@@ -1,18 +1,25 @@
 //! Host-side audio: WASAPI loopback capture + Opus encode + transport.
 //!
-//! v1 captures the *full* system audio mix (default render endpoint
-//! loopback). The per-app blacklist field on [`crate::config::AudioConfig`]
-//! is parsed and warned-on-startup but not yet enforced — that's
-//! per-process [`IAudioClient`] activation via WASAPI process loopback,
-//! tracked as a follow-up.
+//! Two capture paths, picked by config:
 //!
-//! Threading: a single dedicated `std::thread` runs the WASAPI capture
+//! - **No blacklist** → single [`LoopbackCapture`] against the default
+//!   render endpoint. Captures the full system mix (cheap, simplest).
+//! - **Non-empty blacklist** → [`mixer::Mixer`] opens a per-process
+//!   WASAPI loopback for every non-blacklisted session and software-
+//!   mixes them into one stream. Costs one extra capture per app and
+//!   periodic session re-enumeration, but the blacklist actually
+//!   filters.
+//!
+//! Threading: a single dedicated `std::thread` runs the chosen capture
 //! loop, the Opus encoder, and the wire-formatting. Encoded datagrams
 //! are pushed through the same `datagram_tx` mpsc as video, so they
 //! flow through the host's send pacer like everything else.
 
 mod capture;
 mod encoder;
+mod mixer;
+mod process_loopback;
+mod sessions;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +31,10 @@ use tokio::sync::mpsc;
 
 use crate::config::AudioConfig;
 
-pub use self::capture::{LoopbackCapture, CaptureError};
-pub use self::encoder::{OpusEncoder, EncoderError};
+pub use self::capture::{CaptureError, LoopbackCapture};
+pub use self::encoder::{EncoderError, OpusEncoder};
+pub use self::mixer::{Mixer, MixerError};
+pub use self::sessions::list_audio_sessions;
 
 /// 48 kHz is Opus's native rate; libopus accepts {8, 12, 16, 24, 48}
 /// but resamples internally for anything but 48. Picking 48 lets us
@@ -45,6 +54,8 @@ pub enum AudioError {
     Capture(#[from] CaptureError),
     #[error("Opus encoder: {0}")]
     Encoder(#[from] EncoderError),
+    #[error("audio mixer: {0}")]
+    Mixer(#[from] MixerError),
 }
 
 /// Run the audio capture+encode loop on a dedicated thread until
@@ -56,36 +67,68 @@ pub fn run_audio_loop(
     datagram_tx: mpsc::Sender<Vec<u8>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), AudioError> {
-    if !cfg.blacklist.is_empty() {
-        tracing::warn!(
-            blacklist = ?cfg.blacklist,
-            "audio blacklist configured; v1 captures full system audio. \
-            Per-app exclude lands in a follow-up."
-        );
-    }
-
-    let mut capture = LoopbackCapture::open()?;
     let mut encoder = OpusEncoder::new(SAMPLE_RATE, CHANNELS, cfg.bitrate_kbps * 1000)?;
-    tracing::info!(
-        sample_rate = SAMPLE_RATE,
-        channels = CHANNELS,
-        bitrate_kbps = cfg.bitrate_kbps,
-        "audio capture + Opus encoder ready"
-    );
-
-    // Interleaved stereo f32 ring. WASAPI returns variable buffer sizes;
-    // we accumulate to FRAME_SAMPLES * CHANNELS samples before passing
-    // to the encoder.
     let frame_total: usize = FRAME_SAMPLES * CHANNELS as usize;
     let mut accum: Vec<f32> = Vec::with_capacity(frame_total * 4);
+
+    // Pick the capture path based on blacklist. With no blacklist we
+    // grab the system mix straight from the default endpoint (one
+    // capture, cheapest). With any blacklist entry we run a
+    // per-process mixer instead.
+    let mut source: AudioSource = if cfg.blacklist.is_empty() {
+        tracing::info!(
+            sample_rate = SAMPLE_RATE,
+            channels = CHANNELS,
+            bitrate_kbps = cfg.bitrate_kbps,
+            "audio: system-mix loopback path"
+        );
+        AudioSource::System(LoopbackCapture::open()?)
+    } else {
+        tracing::info!(
+            sample_rate = SAMPLE_RATE,
+            channels = CHANNELS,
+            bitrate_kbps = cfg.bitrate_kbps,
+            blacklist = ?cfg.blacklist,
+            "audio: per-process mixer path with blacklist enforcement"
+        );
+        let mut mixer = Mixer::new(cfg.blacklist.clone());
+        // Initial enumeration so we don't ship a few seconds of
+        // silence while waiting for the first refresh tick.
+        if let Err(e) = mixer.refresh() {
+            tracing::warn!(error = %e, "initial mixer refresh failed");
+        }
+        AudioSource::Mixer(mixer)
+    };
+
     let mut sequence: u32 = 0;
     let mut datagram_buf = vec![0u8; HEADER_SIZE + audio::MAX_OPUS_PAYLOAD];
     let mut packets_sent: u64 = 0;
     let mut last_log = std::time::Instant::now();
+    let mut last_refresh = std::time::Instant::now();
 
     while !shutdown.load(Ordering::Acquire) {
-        // ~10 ms wait inside read_into when there's nothing to read.
-        capture.read_into(&mut accum)?;
+        // Periodically reconcile the mixer's source set with currently
+        // active audio sessions: pick up new apps, drop ones that
+        // exited. Cheap (<5 ms typical), once per second.
+        if let AudioSource::Mixer(m) = &mut source
+            && last_refresh.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            if let Err(e) = m.refresh() {
+                tracing::warn!(error = %e, "mixer refresh failed");
+            }
+            last_refresh = std::time::Instant::now();
+        }
+
+        match &mut source {
+            AudioSource::System(c) => {
+                c.read_into(&mut accum)?;
+            }
+            AudioSource::Mixer(m) => {
+                // Pull at most one frame worth at a time so the loop
+                // stays responsive to shutdown flags and refresh ticks.
+                m.read_into(&mut accum, frame_total);
+            }
+        }
 
         while accum.len() >= frame_total {
             let pcm: Vec<f32> = accum.drain(..frame_total).collect();
@@ -121,7 +164,11 @@ pub fn run_audio_loop(
         }
 
         if last_log.elapsed() >= std::time::Duration::from_secs(1) {
-            tracing::debug!(packets_sent, "audio throughput (1s)");
+            let active = match &source {
+                AudioSource::System(_) => 1,
+                AudioSource::Mixer(m) => m.active_sources(),
+            };
+            tracing::debug!(packets_sent, active_sources = active, "audio throughput (1s)");
             packets_sent = 0;
             last_log = std::time::Instant::now();
         }
@@ -129,4 +176,11 @@ pub fn run_audio_loop(
 
     tracing::info!("audio loop exiting");
     Ok(())
+}
+
+/// Either path the audio loop can pull samples from. Each method
+/// produces interleaved stereo f32 at [`SAMPLE_RATE`] for the encoder.
+enum AudioSource {
+    System(LoopbackCapture),
+    Mixer(Mixer),
 }

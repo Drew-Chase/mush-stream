@@ -64,11 +64,13 @@ enum Mode {
     Stream,
     Mp4,
     Png,
+    ListAudioSessions,
 }
 
 /// `mush-stream-host` — desktop capture, NVENC encode, UDP stream to client.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
+#[allow(clippy::struct_excessive_bools)] // mode flags are mutually exclusive via `group = "mode"`
 struct Cli {
     /// Stream video over UDP to the configured peer (default).
     #[arg(long, group = "mode")]
@@ -80,6 +82,11 @@ struct Cli {
     /// crop rectangle).
     #[arg(long, group = "mode")]
     png: bool,
+    /// List the audio sessions on the default render endpoint and exit.
+    /// Use this to discover the right process name to add under
+    /// `[audio].blacklist` in `host.toml`.
+    #[arg(long, group = "mode")]
+    list_audio_sessions: bool,
     /// Path to the host TOML config.
     #[arg(default_value = "./host.toml")]
     config: PathBuf,
@@ -87,7 +94,9 @@ struct Cli {
 
 impl Cli {
     fn mode(&self) -> Mode {
-        if self.png {
+        if self.list_audio_sessions {
+            Mode::ListAudioSessions
+        } else if self.png {
             Mode::Png
         } else if self.mp4 {
             Mode::Mp4
@@ -107,6 +116,13 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let mode = cli.mode();
+
+    // ListAudioSessions doesn't need the config — it's a discovery tool
+    // users run before they've authored host.toml.
+    if mode == Mode::ListAudioSessions {
+        return audio::list_audio_sessions().context("enumerating audio sessions");
+    }
+
     let config_path = cli.config;
     tracing::info!(path = %config_path.display(), ?mode, "loading config");
     let cfg = Config::load(&config_path)
@@ -131,6 +147,7 @@ fn main() -> Result<()> {
         Mode::Png => capture_to_png(cfg.capture.output_index, rect),
         Mode::Mp4 => record_to_mp4(cfg.capture.output_index, rect, &cfg.encode),
         Mode::Stream => run_stream(cfg, rect),
+        Mode::ListAudioSessions => unreachable!("handled above before config load"),
     }
 }
 
