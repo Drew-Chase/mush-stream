@@ -63,7 +63,10 @@ impl OpusEncoder {
             .ff("encoder().audio()")?;
         let sample_rate_i32 = i32::try_from(sample_rate).unwrap_or(48_000);
         enc_ctx.set_rate(sample_rate_i32);
-        enc_ctx.set_format(Sample::F32(ffmpeg::format::sample::Type::Planar));
+        // This libopus build accepts only `flt` (interleaved f32) and
+        // `s16` — not `fltp`. Interleaved is what WASAPI hands us anyway,
+        // so we save the deinterleave.
+        enc_ctx.set_format(Sample::F32(ffmpeg::format::sample::Type::Packed));
         // ffmpeg-the-third 5 / ffmpeg 8 prefer the new ChannelLayout API
         // (set_ch_layout) over the deprecated mask-based set_channels +
         // set_channel_layout.
@@ -86,7 +89,7 @@ impl OpusEncoder {
         let encoder = enc_ctx.open_with(opts).ff("open_with(libopus opts)")?;
 
         let frame = frame::Audio::new(
-            Sample::F32(ffmpeg::format::sample::Type::Planar),
+            Sample::F32(ffmpeg::format::sample::Type::Packed),
             FRAME_SAMPLES,
             layout_mask,
         );
@@ -105,21 +108,17 @@ impl OpusEncoder {
     pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<u8>, EncoderError> {
         debug_assert_eq!(pcm.len(), FRAME_SAMPLES * self.channels as usize);
 
-        // libopus encoder expects PLANAR f32: one slab of L samples
-        // followed by one slab of R samples. Deinterleave from the
-        // capture buffer into the AVFrame's per-channel planes.
-        for ch in 0..self.channels as usize {
-            let plane = self.frame.data_mut(ch);
-            // SAFETY: AVFrame planar buffers are AV_INPUT_BUFFER alignment
-            // (32 bytes) — well past f32's 4-byte alignment requirement.
-            #[allow(clippy::cast_ptr_alignment)]
-            let plane_f32 = unsafe {
-                std::slice::from_raw_parts_mut(plane.as_mut_ptr().cast::<f32>(), FRAME_SAMPLES)
-            };
-            for s in 0..FRAME_SAMPLES {
-                plane_f32[s] = pcm[s * self.channels as usize + ch];
-            }
-        }
+        // Interleaved (Packed) f32: AVFrame allocates one plane sized
+        // `FRAME_SAMPLES * channels`. Just memcpy from the capture buffer.
+        let plane = self.frame.data_mut(0);
+        let total_samples = FRAME_SAMPLES * self.channels as usize;
+        // SAFETY: AVFrame buffers honor AV_INPUT_BUFFER alignment
+        // (32 bytes) — well past f32's 4-byte alignment requirement.
+        #[allow(clippy::cast_ptr_alignment)]
+        let plane_f32 = unsafe {
+            std::slice::from_raw_parts_mut(plane.as_mut_ptr().cast::<f32>(), total_samples)
+        };
+        plane_f32.copy_from_slice(pcm);
         self.frame.set_pts(Some(self.pts));
         // FRAME_SAMPLES = 960; comfortably within i64 — no wrap risk.
         #[allow(clippy::cast_possible_wrap)]
