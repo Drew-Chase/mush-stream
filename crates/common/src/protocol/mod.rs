@@ -1,4 +1,4 @@
-//! Wire protocol for `mush-stream`.
+//! Wire protocol for `app`.
 //!
 //! The transport is UDP with two logical channels on separate ports:
 //! - host→client: video frames, fragmented into `video::MAX_DATAGRAM`-byte

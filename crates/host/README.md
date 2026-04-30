@@ -8,13 +8,13 @@ same socket and applies it to a virtual Xbox 360 controller via ViGEmBus.
 ## Modes
 
 ```sh
-mush-stream-host                      # default: stream
-mush-stream-host --stream             # explicit stream mode
-mush-stream-host --mp4                # record 5s of capture to ./capture-debug.mp4
-mush-stream-host --png                # capture one frame to ./capture-debug.png
+app-host                      # default: stream
+app-host --stream             # explicit stream mode
+app-host --mp4                # record 5s of capture to ./capture-debug.mp4
+app-host --png                # capture one frame to ./capture-debug.png
 
 # All modes accept a positional config path:
-mush-stream-host --stream ./host.toml
+app-host --stream ./host.toml
 ```
 
 The MP4 and PNG modes are verification helpers — useful for confirming

@@ -49,8 +49,8 @@ cp host.toml.example   host.toml
 cp client.toml.example client.toml
 
 just build
-target/dist/host/mush-stream-host.exe       # in one terminal
-target/dist/client/mush-stream-client.exe   # in another
+target/dist/host/app-host.exe       # in one terminal
+target/dist/client/client.exe   # in another
 ```
 
 Press **Ctrl+Alt+D** in the client window to see the debug overlay.
@@ -104,7 +104,7 @@ Each side reads its own TOML. Detailed per-field documentation lives in
 the crate-level READMEs:
 
 - [`crates/mush-stream-host/README.md`](crates/mush-stream-host/README.md)
-- [`crates/mush-stream-client/README.md`](crates/mush-stream-client/README.md)
+- [`crates/mush-stream-client/README.md`](crates/client/README.md)
 
 The minimal configs:
 

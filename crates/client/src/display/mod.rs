@@ -460,7 +460,7 @@ fn render_overlay(buf: &mut [u8], width: u32, height: u32, st: &OverlayState) {
 
 fn build_lines(st: &OverlayState) -> Vec<(String, [u8; 4])> {
     let mut lines: Vec<(String, [u8; 4])> = Vec::new();
-    lines.push(("mush-stream  Ctrl+Alt+D".to_owned(), OVERLAY_DIM));
+    lines.push(("app  Ctrl+Alt+D".to_owned(), OVERLAY_DIM));
     lines.push((
         format!("backend  {}", st.backend.unwrap_or("?")),
         OVERLAY_FG,

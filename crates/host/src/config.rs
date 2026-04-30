@@ -1,4 +1,4 @@
-//! TOML configuration loader for `mush-stream-host`.
+//! TOML configuration loader for `app-host`.
 
 use std::{fs, path::Path};
 

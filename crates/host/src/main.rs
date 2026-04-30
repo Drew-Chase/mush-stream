@@ -1,4 +1,4 @@
-//! `mush-stream-host` — captures a screen region, encodes it, and streams it
+//! `app-host` — captures a screen region, encodes it, and streams it
 //! to a remote client over UDP.
 //!
 //! Three modes:
@@ -67,7 +67,7 @@ enum Mode {
     ListAudioSessions,
 }
 
-/// `mush-stream-host` — desktop capture, NVENC encode, UDP stream to client.
+/// `app-host` — desktop capture, NVENC encode, UDP stream to client.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 #[allow(clippy::struct_excessive_bools)] // mode flags are mutually exclusive via `group = "mode"`
@@ -222,7 +222,7 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
     // client behind NAT can reach the host without manual port
     // forwarding. Held for the lifetime of `run_stream`; Drop unmaps.
     let _upnp_guard = if cfg.network.enable_upnp {
-        UpnpForward::try_forward_udp(cfg.network.listen_port, "mush-stream-host")
+        UpnpForward::try_forward_udp(cfg.network.listen_port, "app-host")
     } else {
         None
     };

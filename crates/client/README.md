@@ -8,8 +8,8 @@ local gamepad to send input back to the host.
 ## Usage
 
 ```sh
-mush-stream-client                  # loads ./client.toml
-mush-stream-client ./other.toml     # explicit config path
+client                  # loads ./client.toml
+client ./other.toml     # explicit config path
 ```
 
 Press **Ctrl+Alt+D** in the client window to toggle a debug overlay.

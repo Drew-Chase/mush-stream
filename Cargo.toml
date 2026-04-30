@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/mush-stream-common",
-    "crates/mush-stream-host",
-    "crates/mush-stream-client",
+    "crates/common",
+    "crates/host",
+    "crates/client",
 ]
 
 [workspace.package]
@@ -72,7 +72,7 @@ cpal = "0.16"
 # For automatic portforwarding
 upnpc-rs = { git = "https://github.com/Drew-Chase/upnpc-rs.git" }
 
-mush-stream-common = { path = "crates/mush-stream-common" }
+mush-stream-common = { path = "crates/common" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

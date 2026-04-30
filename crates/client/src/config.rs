@@ -53,7 +53,7 @@ pub struct DisplayConfig {
 }
 
 fn default_title() -> String {
-    "mush-stream".to_owned()
+    "app".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]

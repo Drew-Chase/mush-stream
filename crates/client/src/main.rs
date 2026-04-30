@@ -1,4 +1,4 @@
-//! `mush-stream-client` — receives video over UDP, decodes via ffmpeg
+//! `client` — receives video over UDP, decodes via ffmpeg
 //! (h264_cuvid → sw fallback), and presents via winit + pixels.
 //!
 //! M6 will add gamepad capture and an input-send loop on the same client
@@ -32,7 +32,7 @@ use crate::display::{DisplayApp, UserEvent};
 use crate::input::{run_gamepad_loop, InputCommand};
 use crate::transport::{connect_to_host, run_input_sender, run_video_receiver, DeliveredFrame};
 
-/// `mush-stream-client` — receives streamed video over UDP, decodes via
+/// `client` — receives streamed video over UDP, decodes via
 /// ffmpeg, presents via winit + pixels, and forwards gamepad input to the
 /// host.
 #[derive(Parser, Debug)]
