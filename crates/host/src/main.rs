@@ -6,14 +6,6 @@
 //! - `--mp4` (M2): capture → NVENC → MP4 file. Verification mode.
 //! - `--png` (M1): capture one frame, write a PNG. Quick crop-rect check.
 
-mod audio;
-mod capture;
-mod config;
-mod encode;
-mod transport;
-mod upnp;
-mod vigem;
-
 use std::{
     fs::File,
     io::BufWriter,
@@ -28,15 +20,15 @@ use clap::Parser;
 use mush_stream_common::protocol::{
     control::ControlMessage, input::InputPacket, video::VideoFramer,
 };
+use mush_stream_host::audio;
+use mush_stream_host::capture::{CaptureError, CaptureRect, Capturer};
+use mush_stream_host::config::Config;
+use mush_stream_host::encode::{Mp4Recorder, VideoEncoder};
+use mush_stream_host::transport::{self, run_host_socket, VIDEO_SEND_CHANNEL};
+use mush_stream_host::upnp::UpnpForward;
+use mush_stream_host::vigem::VirtualGamepad;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
-
-use crate::capture::{CaptureError, CaptureRect, Capturer};
-use crate::config::Config;
-use crate::encode::{Mp4Recorder, VideoEncoder};
-use crate::transport::{run_host_socket, VIDEO_SEND_CHANNEL};
-use crate::upnp::UpnpForward;
-use crate::vigem::VirtualGamepad;
 
 const PNG_OUTPUT_PATH: &str = "./capture-debug.png";
 const MP4_OUTPUT_PATH: &str = "./capture-debug.mp4";
@@ -168,7 +160,7 @@ fn capture_to_png(output_index: u32, rect: CaptureRect) -> Result<()> {
 fn record_to_mp4(
     output_index: u32,
     rect: CaptureRect,
-    enc_cfg: &crate::config::EncodeConfig,
+    enc_cfg: &mush_stream_host::config::EncodeConfig,
 ) -> Result<()> {
     let fps = enc_cfg.fps;
     let bitrate_bps = u64::from(enc_cfg.bitrate_kbps) * 1000;

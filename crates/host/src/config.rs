@@ -2,10 +2,10 @@
 
 use std::{fs, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub capture: CaptureConfig,
     pub network: NetworkConfig,
@@ -14,7 +14,7 @@ pub struct Config {
     pub audio: AudioConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CaptureConfig {
     /// Index of the DXGI output to capture. `0` is the primary monitor.
     pub output_index: u32,
@@ -24,7 +24,7 @@ pub struct CaptureConfig {
     pub height: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// UDP port the host listens on. Clients send their input/control
     /// packets here (and the first one announces them as the peer the
@@ -37,13 +37,13 @@ pub struct NetworkConfig {
     pub enable_upnp: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EncodeConfig {
     pub bitrate_kbps: u32,
     pub fps: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// When true (default), capture system audio on the host and stream
     /// it alongside video. Set false to silence the audio path entirely.

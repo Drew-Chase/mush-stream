@@ -2,10 +2,10 @@
 
 use std::{fs, net::SocketAddr, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub network: NetworkConfig,
     pub display: DisplayConfig,
@@ -14,7 +14,7 @@ pub struct Config {
     pub audio: AudioConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// Play the host's audio stream through the default output device.
     /// Set false to mute the audio path locally without touching the
@@ -32,7 +32,7 @@ impl Default for AudioConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Host's UDP address — `<ip>:<port>`. The client connects its UDP
     /// socket here and sends a discovery probe at startup; the host
@@ -42,7 +42,7 @@ pub struct NetworkConfig {
     pub host: SocketAddr,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayConfig {
     pub width: u32,
     pub height: u32,
@@ -56,7 +56,7 @@ fn default_title() -> String {
     "app".to_owned()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecodeConfig {
     /// Try `h264_cuvid` first; if it fails to initialize (no NVIDIA GPU,
     /// missing driver), fall back to the software h264 decoder.

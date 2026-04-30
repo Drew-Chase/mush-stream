@@ -12,25 +12,20 @@
 //!   reassembled frames via tokio mpsc::Receiver::blocking_recv and pushing
 //!   decoded RGBA via `EventLoopProxy::send_event` to the main thread.
 
-mod audio;
-mod config;
-mod decode;
-mod display;
-mod input;
-mod transport;
-
 use std::{path::PathBuf, sync::atomic::AtomicBool, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use mush_stream_client::audio;
+use mush_stream_client::config::{Config, DecodeConfig, DisplayConfig};
+use mush_stream_client::decode::VideoDecoder;
+use mush_stream_client::display::{self, DisplayApp, UserEvent};
+use mush_stream_client::input::{run_gamepad_loop, InputCommand};
+use mush_stream_client::transport::{
+    connect_to_host, run_input_sender, run_video_receiver, DeliveredFrame,
+};
 use tracing_subscriber::EnvFilter;
 use winit::event_loop::EventLoopProxy;
-
-use crate::config::{Config, DecodeConfig, DisplayConfig};
-use crate::decode::VideoDecoder;
-use crate::display::{DisplayApp, UserEvent};
-use crate::input::{run_gamepad_loop, InputCommand};
-use crate::transport::{connect_to_host, run_input_sender, run_video_receiver, DeliveredFrame};
 
 /// `client` — receives streamed video over UDP, decodes via
 /// ffmpeg, presents via winit + pixels, and forwards gamepad input to the
