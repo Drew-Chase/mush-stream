@@ -6,6 +6,7 @@
 //! - `--mp4` (M2): capture → NVENC → MP4 file. Verification mode.
 //! - `--png` (M1): capture one frame, write a PNG. Quick crop-rect check.
 
+mod audio;
 mod capture;
 mod config;
 mod encode;
@@ -244,6 +245,7 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
         let output_index = cfg.capture.output_index;
         let fps = cfg.encode.fps;
         let bitrate_bps = u64::from(cfg.encode.bitrate_kbps) * 1000;
+        let datagram_tx_for_video = datagram_tx.clone();
         let encode_handle = std::thread::Builder::new()
             .name("mush-encode".into())
             .spawn(move || {
@@ -252,7 +254,7 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
                     rect,
                     fps,
                     bitrate_bps,
-                    datagram_tx,
+                    datagram_tx_for_video,
                     control_rx,
                     shutdown_for_capture,
                 ) {
@@ -260,6 +262,29 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
                 }
             })
             .context("spawning capture+encode thread")?;
+
+        // Audio thread: WASAPI loopback → Opus → datagram_tx. Off by
+        // default-true config; opt out via [audio] enabled = false.
+        let audio_handle = if cfg.audio.enabled {
+            let audio_cfg = cfg.audio.clone();
+            let audio_tx = datagram_tx.clone();
+            let audio_shutdown = shutdown.clone();
+            Some(
+                std::thread::Builder::new()
+                    .name("mush-audio".into())
+                    .spawn(move || {
+                        if let Err(e) =
+                            audio::run_audio_loop(audio_cfg, audio_tx, audio_shutdown)
+                        {
+                            tracing::error!(error = %e, "audio loop exited with error");
+                        }
+                    })
+                    .context("spawning audio thread")?,
+            )
+        } else {
+            tracing::info!("audio disabled in config; not capturing");
+            None
+        };
 
         // ViGEm thread: applies received InputPackets to a virtual Xbox 360.
         // Connects lazily — if the driver is missing, log and skip without
@@ -302,6 +327,9 @@ fn run_stream(cfg: Config, rect: CaptureRect) -> Result<()> {
         let _ = tokio::task::spawn_blocking(move || {
             let _ = encode_handle.join();
             let _ = vigem_handle.join();
+            if let Some(h) = audio_handle {
+                let _ = h.join();
+            }
         })
         .await;
         host_sock.abort();

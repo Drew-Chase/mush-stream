@@ -10,6 +10,8 @@ pub struct Config {
     pub capture: CaptureConfig,
     pub network: NetworkConfig,
     pub encode: EncodeConfig,
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +41,44 @@ pub struct NetworkConfig {
 pub struct EncodeConfig {
     pub bitrate_kbps: u32,
     pub fps: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioConfig {
+    /// When true (default), capture system audio on the host and stream
+    /// it alongside video. Set false to silence the audio path entirely.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Opus target bitrate in kbps. 96 kbps stereo is the default —
+    /// pretty much transparent at speech and game-soundtrack range.
+    #[serde(default = "default_audio_bitrate")]
+    pub bitrate_kbps: u32,
+    /// Process names (case-insensitive, with or without `.exe`) whose
+    /// audio output should be excluded from the captured mix. The host
+    /// enumerates audio sessions on the default render device, captures
+    /// each non-blacklisted session via WASAPI process loopback, and
+    /// mixes them. Common entries: "discord.exe", "chrome.exe",
+    /// "firefox.exe".
+    #[serde(default)]
+    pub blacklist: Vec<String>,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            bitrate_kbps: default_audio_bitrate(),
+            blacklist: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_audio_bitrate() -> u32 {
+    96
 }
 
 #[derive(Debug, Error)]
