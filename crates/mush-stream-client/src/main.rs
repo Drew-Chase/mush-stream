@@ -56,12 +56,15 @@ fn main() -> Result<()> {
         .with_context(|| format!("loading client config from {}", config_path.display()))?;
 
     let (event_loop, proxy) = display::build_event_loop()?;
-    // Small bound on purpose: any backlog here is lag the user will see.
-    // 16 frames is ~250ms slack at 60fps — enough to absorb a tokio
-    // scheduling hiccup, far short of "hide a chronic bottleneck and
-    // ship stale frames forever". The 8 MiB UDP recv buffer is what
-    // absorbs network bursts; this channel must NOT double-buffer them.
-    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<DeliveredFrame>(16);
+    // 4 frames ≈ 67 ms slack at 60 fps. Just enough to absorb a tokio
+    // scheduling hiccup; tighter than this and even a single missed
+    // wake-up triggers a stall, looser and the worst-case queueing
+    // latency starts pulling p95/p99 lag up. The decoder's
+    // fast-forward path (decode_without_present on backlog) means we
+    // don't need this to be larger to hide load — it's purely a
+    // scheduling cushion. The 8 MiB kernel UDP recv buffer absorbs
+    // network bursts; this channel must NOT double-buffer them.
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<DeliveredFrame>(4);
 
     // Decode thread.
     let proxy_for_decode = proxy.clone();
