@@ -200,7 +200,7 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
                 tracing::info!(
                     width = self.config.width,
                     height = self.config.height,
-                    "display window created (Ctrl+Alt+D toggles debug overlay)"
+                    "display window created (Alt+Enter toggles fullscreen, Ctrl+Alt+D toggles debug overlay)"
                 );
             }
             Err(e) => {
@@ -225,19 +225,47 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
                 self.modifiers = m.state();
             }
             WindowEvent::KeyboardInput { event: ke, .. } => {
-                // Ctrl+Alt+D toggles the debug overlay. Suppress on
-                // auto-repeat so holding it down doesn't strobe.
-                if matches!(ke.state, ElementState::Pressed)
-                    && !ke.repeat
-                    && let PhysicalKey::Code(KeyCode::KeyD) = ke.physical_key
-                    && self.modifiers.control_key()
-                    && self.modifiers.alt_key()
-                {
-                    self.show_debug = !self.show_debug;
-                    tracing::info!(show_debug = self.show_debug, "debug overlay toggled");
-                    if let Some(window) = self.window {
-                        window.request_redraw();
+                // Only react to fresh presses; `repeat` would otherwise
+                // strobe the toggles when the chord is held.
+                if !matches!(ke.state, ElementState::Pressed) || ke.repeat {
+                    return;
+                }
+                match ke.physical_key {
+                    // Ctrl+Alt+D toggles the debug overlay.
+                    PhysicalKey::Code(KeyCode::KeyD)
+                        if self.modifiers.control_key()
+                            && self.modifiers.alt_key() =>
+                    {
+                        self.show_debug = !self.show_debug;
+                        tracing::info!(
+                            show_debug = self.show_debug,
+                            "debug overlay toggled"
+                        );
+                        if let Some(window) = self.window {
+                            window.request_redraw();
+                        }
                     }
+                    // Alt+Enter toggles borderless fullscreen. Reject
+                    // when Ctrl is also held so we don't collide with
+                    // future Ctrl+Alt+Enter combos.
+                    PhysicalKey::Code(KeyCode::Enter)
+                        if self.modifiers.alt_key()
+                            && !self.modifiers.control_key() =>
+                    {
+                        if let Some(window) = self.window {
+                            let next = if window.fullscreen().is_some() {
+                                None
+                            } else {
+                                Some(Fullscreen::Borderless(None))
+                            };
+                            tracing::info!(
+                                fullscreen = next.is_some(),
+                                "fullscreen toggled (Alt+Enter)"
+                            );
+                            window.set_fullscreen(next);
+                        }
+                    }
+                    _ => {}
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
