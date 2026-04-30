@@ -1,7 +1,14 @@
 set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
-# List recipes when run with no args.
-default:
+# Build and launch the Tauri desktop app (default).
+default: app
+
+# Build and launch the Tauri desktop app (dev mode — hot reload).
+app:
+    cd crates/app; pnpm tauri-dev
+
+# List all available recipes.
+list:
     @just --list
 
 # ---------------- distribution ----------------
