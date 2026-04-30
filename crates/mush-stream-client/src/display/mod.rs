@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use font8x8::UnicodeFonts;
-use pixels::{Pixels, SurfaceTexture};
+use pixels::{wgpu::PresentMode, Pixels, PixelsBuilder, SurfaceTexture};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -183,7 +183,17 @@ impl ApplicationHandler<UserEvent> for DisplayApp {
         let window: &'static Window = Box::leak(Box::new(window));
 
         let surface = SurfaceTexture::new(self.config.width, self.config.height, window);
-        match Pixels::new(self.config.width, self.config.height, surface) {
+        // Mailbox: latest-frame-wins, GPU never blocks the render() call
+        // waiting on vsync. Pixels' default is `AutoVsync` (FIFO), which
+        // will stall render() for up to 16 ms (or a *lot* longer if the
+        // GPU has any contention). For low-latency streaming we'd
+        // rather drop a frame than buffer one. Falls back to FIFO if
+        // the surface doesn't support Mailbox.
+        let pixels_result =
+            PixelsBuilder::new(self.config.width, self.config.height, surface)
+                .present_mode(PresentMode::Mailbox)
+                .build();
+        match pixels_result {
             Ok(pixels) => {
                 self.pixels = Some(pixels);
                 self.window = Some(window);
