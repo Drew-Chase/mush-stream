@@ -37,6 +37,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../../../ViGEmBus_1.18.367_x64_x86.exe": "ViGEmBus_1.18.367_x64_x86.exe"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./installer-hooks.nsh",
+        "installMode": "perMachine"
+      }
+    }
   }
 }
