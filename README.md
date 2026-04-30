@@ -2,200 +2,251 @@
 
 Low-latency Windows-to-Windows desktop streaming for two-player split-screen
 gaming. The host captures a configurable rectangular region of its desktop,
-hardware-encodes it via NVENC, and streams it over UDP to a remote client. The
-client decodes and displays the video, captures the friend's gamepad, and sends
-input back to the host where it is injected as a virtual Xbox 360 controller.
+hardware-encodes it via NVENC, and streams it over UDP to a remote client.
+The client decodes and displays the video, captures the friend's gamepad,
+and sends input back to the host where it is injected as a virtual Xbox 360
+controller via ViGEmBus.
 
 Targets Windows 10/11 x86_64 only.
 
 ## What works
 
-### Milestone 1 — capture-to-PNG ✅
+- **Capture** — DXGI Desktop Duplication, GPU-side crop with
+  `CopySubresourceRegion` to a sub-texture sized to the configured
+  rectangle. Rate-limited to the configured fps so high-refresh host
+  monitors don't over-drive NVENC.
+- **Encode** — `h264_nvenc` via `ffmpeg-the-third`. Tuned for low-latency
+  live: preset p4, `tune=ll`, `zerolatency=1`, no B-frames, no lookahead,
+  CBR, `multipass=qres`, spatial AQ. Default 9 Mbps at 60 fps for 1440p
+  streams looks clean.
+- **Wire protocol** — single UDP socket per side. The host learns the
+  client's address from the first packet it receives; UDP hole-punching
+  takes care of the NAT return path. 20-byte little-endian video packet
+  header, ≤1200-byte NAL fragments, ≤1400-byte UDP datagrams. Reed-Solomon
+  FEC at 10% redundancy so single-packet drops recover without an IDR.
+- **Decode** — `h264_cuvid` (NVIDIA hardware) with software h264 fallback.
+- **Display** — `winit` + `pixels` with Mailbox present mode (no vsync
+  blocking). Decoder fast-forwards through any frame backlog so a
+  pipeline stall surfaces as a single jump-forward, never as slow-motion
+  catch-up.
+- **Input** — gamepad polling at 250 Hz via `gilrs`, packed into the wire
+  format using `vigem-client`'s `XButtons` bit layout so the host plugs
+  the bits straight into a virtual Xbox 360 controller via ViGEmBus.
+- **Resilience** — keyframe-on-loss recovery, send-side token-bucket
+  pacing sized to absorb a full keyframe, 8 MiB UDP buffers on both
+  sides, optional UPnP forwarding for the host's listen port.
+- **Diagnostics** — Ctrl+Alt+D toggles a debug overlay on the client
+  showing backend, fps, bitrate, lag, and rolling p50/p95/p99/max.
+  Both sides emit a per-second throughput log line at info level.
+- **Distribution** — `just build` produces `target/dist/{host,client}/`
+  containing the binary, every ffmpeg DLL, the `.toml.example`, and the
+  README. Send the folder to a friend.
 
-- Cargo workspace with three crates: `mush-stream-common`, `mush-stream-host`,
-  `mush-stream-client`.
-- TOML configuration loader (`host.toml`).
-- DXGI Desktop Duplication capture; GPU-side crop with `CopySubresourceRegion`
-  into a sub-texture sized to the configured rectangle.
-- `mush-stream-host --png` writes one cropped frame to `./capture-debug.png`
-  for visual verification of the capture rectangle.
+## Quickstart (localhost)
 
-### Milestone 2 — capture + encode to MP4 ✅
+```sh
+cp host.toml.example   host.toml
+cp client.toml.example client.toml
 
-- `h264_nvenc` encoder via `ffmpeg-the-third`, configured per spec: preset
-  `p1`, tune `ll`, `zerolatency=1`, no B-frames, gop = fps (1-second keyframe
-  interval), configurable bitrate. Plus low-latency-friendly options
-  `rc=cbr`, `delay=0`, `rc-lookahead=0`, `no-scenecut=1`.
-- MP4 muxing with global-header SPS/PPS extradata.
-- `mush-stream-host --mp4` records 5 seconds to `./capture-debug.mp4`.
-  Verify by playing it in VLC or running `ffprobe ./capture-debug.mp4`.
+just build
+target/dist/host/mush-stream-host.exe       # in one terminal
+target/dist/client/mush-stream-client.exe   # in another
+```
 
-### Milestone 3 — wire protocol ✅
-
-- `mush-stream-common::protocol` ships the wire formats: 20-byte little-endian
-  video packet header (≤1200 byte NAL fragments, ≤1400 byte UDP datagrams),
-  16-byte input packets, 1-byte control tags (`request_keyframe`, `disconnect`).
-- `VideoFramer` splits encoder NAL output into UDP datagrams with a
-  caller-supplied emit closure (no per-frame allocation in the hot path).
-- `VideoReassembler` accumulates packets per `frame_id`, tolerates reorder,
-  drops stale frames after newer ones complete, evicts oldest pending frames
-  when `max_pending` is exceeded, rejects malformed inputs.
-- `InputReceiver` enforces drop-on-stale-sequence using 16-bit wrapping
-  comparison.
-
-### Milestone 4 — end-to-end video over UDP ✅
-
-- `mush-stream-host` (default mode now `--stream`) spawns a tokio runtime,
-  drives capture+encode in a dedicated `std::thread` (DXGI/NVENC are sync
-  APIs), and `tokio::UdpSocket`s the framed datagrams to the configured peer.
-- `mush-stream-client` binds the configured port, drains UDP into the
-  reassembler, decodes via `h264_cuvid` (NVIDIA hardware decode) with software
-  h264 fallback, blits decoded RGBA into a `pixels` framebuffer presented by
-  a `winit` window.
-- Threading: main runs `winit` (winit requires it); two `std::thread`s host
-  the tokio runtime and the sync ffmpeg decoder; tokio mpsc bridges them.
-
-### Milestone 5 — latency measurement + NVENC tuning ✅
-
-- Wire header carries `timestamp_us` (host capture wallclock); the client
-  computes glass-to-glass latency at present time and logs a rolling
-  60-frame percentile snapshot (min/p50/p95/p99/max/avg) once per second.
-- Cumulative min/max/avg dumped on shutdown.
-- NVENC private options tuned for low-latency live (see M2 above).
-
-### Milestone 6 — gamepad passthrough ✅
-
-- Client polls a connected gamepad via `gilrs` in a dedicated `std::thread`
-  at the project-spec 250 Hz cadence. Each tick snapshots state into an
-  `InputPacket` packed with `vigem-client::XButtons` bit layout (= XINPUT)
-  and pushes via tokio mpsc to the network thread, which UDP-sends to the
-  host.
-- Host receives input/control on the input port, dispatches by datagram
-  size (16 = input, 1 = control), forwards inputs to a ViGEm thread that
-  applies them to a virtual Xbox 360 wired controller. Degrades gracefully
-  if ViGEmBus driver is missing — video keeps streaming, input is dropped
-  with a logged warning.
-
-### Milestone 7 — robustness ✅
-
-- **Keyframe-on-loss recovery**: client video receiver watches the
-  `frame_id` sequence; on a forward gap (one or more frames lost in transit)
-  or a non-IDR first frame (mid-stream join), pushes
-  `ControlMessage::RequestKeyframe` to the host. Rate-limited to one
-  request per 200 ms. Host's encode loop drains the channel and forces an
-  IDR on the next frame via NVENC's `pict_type = AV_PICTURE_TYPE_I`.
-- **FEC at 10% redundancy**: `VideoFramer::frame_with_fec(parity_ratio)`
-  computes Reed-Solomon parity shards via `reed-solomon-erasure`. Wire
-  format extends the header with `parity_count` (u8) and `last_data_size`
-  (u16) using the M3 pad bytes — when FEC is off, byte-equivalent to M3.
-  Receiver collects any N of N+K shards per frame and reconstructs missing
-  data.
-- **Send-side pacing**: host UDP sender awaits a token bucket sized in
-  bytes (capacity ~12 packets, refill rate = encoder bitrate × 1.25
-  headroom) before each `socket.send`, so encoder bursts don't micro-flood
-  the receiver.
+Press **Ctrl+Alt+D** in the client window to see the debug overlay.
 
 ## Setup
 
-### One-time: install ffmpeg dev libraries (host **and** client)
+### ffmpeg dev libraries (one-time, both sides)
 
-Both `mush-stream-host` and `mush-stream-client` link against ffmpeg with
-NVENC + h264 decode support. Neither will compile until ffmpeg headers and
-import libraries are available to the cargo build.
+`mush-stream-host` and `mush-stream-client` both link against ffmpeg with
+NVENC + h264 decode support. Neither will compile until ffmpeg headers
+and import libraries are available.
 
-Recommended path on Windows:
-
-1. Install `pkg-config` (e.g. `winget install bloodrock.pkgconfiglite` or
-   the choco/scoop equivalent) and ensure it's on `PATH`.
-2. Download an ffmpeg "shared" build that includes NVENC, e.g. from
-   <https://www.gyan.dev/ffmpeg/builds/> (the `release-shared` package) or
-   the BtbN GitHub releases.
-3. Extract somewhere stable, e.g. `C:\ffmpeg\`.
+1. Install `pkg-config` (e.g. `winget install bloodrock.pkgconfiglite`)
+   and ensure it's on `PATH`.
+2. Download an ffmpeg "shared" build, e.g. the **release-shared** package
+   from <https://www.gyan.dev/ffmpeg/builds/> or a `*-shared.zip` from
+   the BtbN GitHub releases. Pick the variant that has `bin/`, `lib/`,
+   and `include/` folders.
+3. Extract somewhere stable (e.g. `C:\ffmpeg\`).
 4. Set, in System or User environment variables:
-   - `FFMPEG_DIR=C:\ffmpeg`
+   - `FFMPEG_DIR=C:\ffmpeg`  *(point at the folder above the `bin/`)*
    - `PKG_CONFIG_PATH=C:\ffmpeg\lib\pkgconfig`
-   - Add `C:\ffmpeg\bin` to `PATH` (so the runtime DLLs are findable).
-5. Restart your shell / IDE so the env vars take effect, then
-   `cargo build --workspace`.
+   - Add `C:\ffmpeg\bin` to `PATH` for runtime DLL discovery.
+5. Restart your shell / IDE.
 
-Alternatively, vcpkg works:
-`vcpkg install ffmpeg[nvcodec]:x64-windows`, then set `VCPKG_ROOT`.
+The `build.rs` in each binary crate auto-copies `$FFMPEG_DIR/bin/*.dll`
+into `target/{profile}/` and `target/{profile}/deps/` on every build,
+so `cargo run` and the produced `.exe` find the runtime DLLs without
+any further PATH fiddling. `just build` propagates the same DLLs into
+the dist subfolders.
 
-### Other requirements
+`vcpkg install ffmpeg[nvcodec]:x64-windows` works as an alternative if
+you prefer.
 
-- **Host**: NVIDIA GPU with NVENC; ViGEmBus driver
-  (<https://github.com/nefarius/ViGEmBus>) for virtual gamepad injection.
-- **Client**: any GPU; D3D11-capable for hardware decode (otherwise the
-  software h264 path is used).
+### Host requirements
 
-## How to run
+- NVIDIA GPU with NVENC support (any GTX 600-series or newer; almost
+  certainly already present if you're considering streaming).
+- [ViGEmBus](https://github.com/nefarius/ViGEmBus) driver for virtual
+  gamepad injection. The host degrades gracefully without it — video
+  keeps streaming, input is dropped with a logged warning.
 
-```sh
-# One-time:
-cp host.toml.example host.toml      # on the host machine
-cp client.toml.example client.toml  # on the client machine
-# Edit each to point at the right [network] addresses for your setup.
+### Client requirements
+
+- Any GPU. h264_cuvid is preferred when available (NVIDIA), software
+  h264 otherwise.
+
+## Configuration
+
+Each side reads its own TOML. Detailed per-field documentation lives in
+the crate-level READMEs:
+
+- [`crates/mush-stream-host/README.md`](crates/mush-stream-host/README.md)
+- [`crates/mush-stream-client/README.md`](crates/mush-stream-client/README.md)
+
+The minimal configs:
+
+```toml
+# host.toml
+[capture]
+output_index = 0
+x = 2560
+y = 0
+width  = 2560
+height = 1440
+
+[network]
+listen_port = 9002
+enable_upnp = false
+
+[encode]
+bitrate_kbps = 9000
+fps          = 60
 ```
 
-### Stream end-to-end on localhost (M4 verification)
+```toml
+# client.toml
+[network]
+host = "192.168.1.100:9002"   # host's address — only field the client needs
 
-Two terminals, same machine:
+[display]
+width  = 2560
+height = 1440
+title  = "mush-stream"
+fullscreen = false
 
-```sh
-# Terminal 1 (client) — open the window first:
-cargo run -p mush-stream-client
-
-# Terminal 2 (host) — start streaming once the client is listening:
-cargo run -p mush-stream-host
-```
-
-The client window should display the host's configured capture region
-in real time. Set `RUST_LOG=info` (default) to see the rolling
-glass-to-glass latency snapshots; `RUST_LOG=debug` for verbose tracing.
-
-### Other host modes
-
-```sh
-# Record a 5-second MP4 verification clip (M2):
-cargo run -p mush-stream-host -- --mp4
-
-# Single-frame PNG of the configured crop (M1):
-cargo run -p mush-stream-host -- --png
-
-# Pass a config path (works in any mode):
-cargo run -p mush-stream-host -- --stream ./host.toml
+[decode]
+prefer_hardware = true
 ```
 
 ## Networking
 
 The recommended path is [Tailscale](https://tailscale.com/) — both sides
-bind to a configurable interface, and Tailscale handles encryption and
-peer discovery. No further configuration needed beyond pointing each
-side's config at the other's Tailscale IP.
+get a routable IP, encryption is handled, no UPnP fiddling. Set the
+client's `host` to the host machine's Tailscale address.
 
-### Optional: UPnP port forwarding
+Without Tailscale, set `enable_upnp = true` in `host.toml` so the host's
+listen port is forwarded automatically through the host's router. The
+client doesn't need any port forwarding — its outbound `connect()` opens
+the NAT return path for free (UDP hole-punching). UPnP failures are
+logged and ignored; the binary keeps running but won't be reachable from
+outside the LAN.
 
-If you're not on Tailscale and your router supports UPnP, set
-`[network] enable_upnp = true` in either `host.toml` or `client.toml`
-and the corresponding side will request a UDP port mapping at startup
-(host forwards `input_bind`, client forwards `video_bind`). The mapping
-is removed on graceful shutdown via an RAII guard. UPnP failures are
-logged and otherwise ignored — the binary continues to run, you just
-won't be reachable from outside the LAN until you configure forwarding
-manually.
+## Debug overlay
 
-UPnP traffic is unencrypted; if you care about that, stick with
-Tailscale.
+Press **Ctrl+Alt+D** in the client window to toggle:
+
+```
+mush-stream  Ctrl+Alt+D
+backend  h264_cuvid
+frames   12345
+fps      59.7
+rx Mbps  9.42
+lag ms   18
+p50/95/99/max ms  17/22/29/33
+```
+
+`lag ms` is monotonic-clock measured: the time between the first packet
+of a frame arriving at the client and that frame being on screen. It
+captures network-arrival → render latency. The capture/encode/wire
+portion is hidden but constant, so the variance you see here is what
+matters for tuning.
+
+## Distribution
+
+```sh
+just build
+```
+
+Produces `target/dist/host/` and `target/dist/client/`, each
+self-contained with the binary, every ffmpeg DLL, the `.toml.example`,
+and the README. Zip up either subfolder and send it to a friend; they
+edit the `.toml`, run the `.exe`, done.
+
+## Architecture
+
+Three crates:
+
+- **`mush-stream-common`** — wire protocol (video framer/reassembler,
+  input + control packets, FEC encode/decode). No I/O. 27 unit tests.
+- **`mush-stream-host`** — capture + encode + UDP transport + ViGEm.
+  Two threads beyond tokio: one for the sync DXGI/NVENC capture loop,
+  one for the sync ViGEm device updates.
+- **`mush-stream-client`** — UDP transport + decode + display + gamepad.
+  Three threads beyond tokio: one for the sync ffmpeg decoder, one for
+  gilrs polling, one for winit on main.
+
+Both sides use a single UDP socket. The host's socket is bound to the
+configured `listen_port` and learns its peer from the first received
+packet. The client's socket is `connect()`-ed to `host`; the kernel
+filters incoming traffic to that peer, and the same socket carries
+input/control out to the host.
+
+Two stages of latency control:
+- **Token-bucket pacer** on the host's send side, sized at 256 KiB
+  (~one keyframe) so IDR bursts clear without throttling, refill
+  rate at `bitrate × 1.25`.
+- **Decoder fast-forward** on the client: any backlog of pending
+  frames is reference-decoded cheaply through NVDEC and only the
+  freshest is colour-converted + presented.
 
 ## Tests
 
 ```sh
-cargo test -p mush-stream-common
+cargo test --workspace
 ```
 
-The protocol crate has 31 unit tests covering header roundtrip,
-single/multi-packet roundtrip, reorder, drop, duplicate, stale-after-newer,
-eviction, malformed inputs, sequence wraparound, control messages, FEC
-roundtrip, FEC reconstruct from data drop, FEC fast-path on parity drop,
-and FEC unrecoverable loss. The host transport's `TokenBucket` has 2 timing
-tests using `tokio::test(start_paused = true)`.
+`mush-stream-common` ships 27 unit tests covering header roundtrip,
+single/multi-packet roundtrip, reorder, drop, duplicate,
+stale-after-newer, eviction, malformed inputs, sequence wraparound,
+control messages, FEC encode + reconstruct, fallback when FEC frame
+exceeds galois_8 limit, and the input drop-on-stale-sequence logic.
+`mush-stream-host` ships 2 deterministic timing tests for the
+`TokenBucket` using `tokio::test(start_paused = true)`.
+
+## Logs
+
+`RUST_LOG=info` (default) prints once-per-second throughput summaries
+on each side:
+
+```
+INFO host throughput (1s) frames=60 bytes=412345 dropped_full_channel=0 keyframes_forced=0 max_iter_us=4823
+INFO client recv throughput (1s) packets=520 bytes=730000 frames=60 gaps=0 keyframe_requests=1
+```
+
+Plus the client emits a percentile snapshot every 60 frames:
+
+```
+INFO client lag window count=60 min_us=15041 p50_us=17104 p95_us=22011 p99_us=28944 max_us=33102 avg_us=18327
+```
+
+When something stalls these are usually enough to localise it. If
+the host's `frames` counter goes to 0 for a second, the host stopped
+producing; if the host stays healthy and the client's `packets`
+counter goes to 0, the network's the issue; if both stay healthy and
+the overlay's fps drops, the decode/render side is at fault.
+
+`RUST_LOG=debug` adds per-event detail: keyframe-request reasons,
+backlog fast-forward events, duplicate-packet drops, etc.
