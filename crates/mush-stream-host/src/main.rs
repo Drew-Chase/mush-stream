@@ -39,7 +39,15 @@ use crate::vigem::VirtualGamepad;
 
 const PNG_OUTPUT_PATH: &str = "./capture-debug.png";
 const MP4_OUTPUT_PATH: &str = "./capture-debug.mp4";
+/// First-frame ramp: DXGI Desktop Duplication needs a few acquisitions
+/// before delivering content (the compositor primes its state). 60
+/// attempts × 16ms timeout each = ~1s, plenty.
 const FIRST_FRAME_MAX_ATTEMPTS: u32 = 60;
+/// Steady-state capture timeout for the streaming hot loop. Just one
+/// attempt — the rate-limit at the bottom of the loop owns frame
+/// pacing, and waiting up to ~1s here would freeze the stream during
+/// any static-screen window.
+const STREAM_ACQUIRE_ATTEMPTS: u32 = 1;
 const RECORD_SECONDS: u32 = 5;
 
 /// Reed-Solomon parity ratio applied per frame. 0.10 = ~10% extra parity
@@ -327,6 +335,12 @@ fn run_capture_encode_loop(
     let mut pts: i64 = 0;
     let mut dropped_full_channel: u64 = 0;
     let mut keyframes_forced: u64 = 0;
+    // Per-second throughput counters (reset each tick) so info-level
+    // logs can attribute pauses without enabling debug.
+    let mut frames_this_sec: u64 = 0;
+    let mut nal_bytes_this_sec: u64 = 0;
+    let mut last_log = std::time::Instant::now();
+    let mut max_iter_us: u64 = 0;
 
     // Cap the capture+encode rate to the configured fps. DXGI Desktop
     // Duplication delivers frames at the host's monitor refresh (often
@@ -337,6 +351,7 @@ fn run_capture_encode_loop(
     let mut next_deadline = std::time::Instant::now() + frame_interval;
 
     while !shutdown.load(Ordering::Acquire) {
+        let iter_start = std::time::Instant::now();
         // Drain pending control messages before encoding the next frame.
         // Coalesce: multiple RequestKeyframes between frames just flag
         // keyframe once.
@@ -353,7 +368,16 @@ fn run_capture_encode_loop(
             }
         }
 
-        match capturer.next_frame_bgra(FIRST_FRAME_MAX_ATTEMPTS) {
+        // First call gets the long ramp timeout; subsequent calls only
+        // wait one frame interval. If DXGI has nothing new (static
+        // screen) we fall through with `last_frame` unchanged and the
+        // encoder repeats the previous BGRA — no multi-second freeze.
+        let attempts = if have_first_frame {
+            STREAM_ACQUIRE_ATTEMPTS
+        } else {
+            FIRST_FRAME_MAX_ATTEMPTS
+        };
+        match capturer.next_frame_bgra(attempts) {
             Ok(bgra) => {
                 last_frame.copy_from_slice(bgra);
                 have_first_frame = true;
@@ -381,6 +405,7 @@ fn run_capture_encode_loop(
                 let is_keyframe = packet
                     .flags()
                     .contains(ffmpeg_the_third::codec::packet::Flags::KEY);
+                nal_bytes_this_sec = nal_bytes_this_sec.saturating_add(nal.len() as u64);
                 let emit = |datagram: &[u8]| {
                     match datagram_tx.try_send(datagram.to_vec()) {
                         // Closed: network task gone, nothing more we can
@@ -412,14 +437,31 @@ fn run_capture_encode_loop(
                 Ok(())
             })
             .with_context(|| format!("encoding frame pts={pts}"))?;
+        frames_this_sec += 1;
 
         pts = pts.wrapping_add(1);
-        if pts > 0 && pts % i64::from(fps) == 0 {
-            tracing::debug!(
-                seconds = pts / i64::from(fps),
+
+        // Per-iteration cost: useful for spotting stalls.
+        let iter_us = u64::try_from(iter_start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        max_iter_us = max_iter_us.max(iter_us);
+
+        // Once per second emit a throughput line. If a pause shows up at
+        // the user, this lets us see whether the host stopped producing
+        // (counter goes to zero) or the host kept producing and the
+        // pause is downstream.
+        if last_log.elapsed() >= std::time::Duration::from_secs(1) {
+            tracing::info!(
+                frames = frames_this_sec,
+                bytes = nal_bytes_this_sec,
                 dropped_full_channel,
-                "..."
+                keyframes_forced,
+                max_iter_us,
+                "host throughput (1s)"
             );
+            frames_this_sec = 0;
+            nal_bytes_this_sec = 0;
+            max_iter_us = 0;
+            last_log = std::time::Instant::now();
         }
 
         // Pace to the configured fps. Sleep until the next frame's
