@@ -73,7 +73,7 @@ impl OpusDecoder {
         let mut out: Vec<f32> = Vec::new();
         loop {
             match self.decoder.receive_frame(&mut decoded) {
-                Ok(()) => append_planar_f32_as_interleaved(
+                Ok(()) => append_f32_as_interleaved(
                     &decoded,
                     self.channels as usize,
                     &mut out,
@@ -91,39 +91,89 @@ impl OpusDecoder {
     }
 }
 
-/// Convert libopus's planar-f32 output to interleaved-f32 for cpal.
-fn append_planar_f32_as_interleaved(frame: &frame::Audio, channels: usize, out: &mut Vec<f32>) {
+/// i16 -> f32 in [-1.0, 1.0]. 32768 (= |i16::MIN|) maps the most-
+/// negative input to exactly -1.0 — the cleanest symmetric mapping for
+/// cpal's f32 stream.
+const I16_TO_F32_SCALE: f32 = 1.0 / 32_768.0;
+
+/// Append decoded f32 samples to `out` in interleaved order.
+///
+/// The libopus build that ships with our ffmpeg emits `flt` (interleaved
+/// f32) from its decoder, but the wrapper handles both layouts so we
+/// don't depend on the build's behavior.
+fn append_f32_as_interleaved(frame: &frame::Audio, channels: usize, out: &mut Vec<f32>) {
     let samples = frame.samples();
     if samples == 0 {
         return;
     }
-    let format_is_planar_f32 = matches!(
-        frame.format(),
-        Sample::F32(ffmpeg::format::sample::Type::Planar)
-    );
-    if !format_is_planar_f32 {
-        // libopus consistently emits planar f32; if the format ever
-        // surprises us, log and skip rather than misinterpret bytes.
-        let fmt = frame.format();
-        tracing::warn!(?fmt, "unexpected Opus decoded format; skipping");
-        return;
-    }
-    out.reserve(samples * channels);
-    let planes: Vec<&[f32]> = (0..channels)
-        .map(|c| {
-            let bytes = frame.data(c);
-            // SAFETY: planar f32 — `bytes` is `samples * 4` long.
-            // AVFrame planar buffers honor AV_INPUT_BUFFER alignment
-            // (32 bytes) — past f32's 4-byte requirement.
+    match frame.format() {
+        Sample::F32(ffmpeg::format::sample::Type::Packed) => {
+            let bytes = frame.data(0);
+            // SAFETY: packed f32 — bytes is `samples * channels * 4` long.
+            // AVFrame buffers honor AV_INPUT_BUFFER alignment.
             #[allow(clippy::cast_ptr_alignment)]
-            unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), samples)
+            let interleaved = unsafe {
+                std::slice::from_raw_parts(
+                    bytes.as_ptr().cast::<f32>(),
+                    samples * channels,
+                )
+            };
+            out.extend_from_slice(interleaved);
+        }
+        Sample::F32(ffmpeg::format::sample::Type::Planar) => {
+            out.reserve(samples * channels);
+            let planes: Vec<&[f32]> = (0..channels)
+                .map(|c| {
+                    let bytes = frame.data(c);
+                    // SAFETY: planar f32 — bytes is `samples * 4` long.
+                    #[allow(clippy::cast_ptr_alignment)]
+                    unsafe {
+                        std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), samples)
+                    }
+                })
+                .collect();
+            for s in 0..samples {
+                for plane in &planes {
+                    out.push(plane[s]);
+                }
             }
-        })
-        .collect();
-    for s in 0..samples {
-        for plane in &planes {
-            out.push(plane[s]);
+        }
+        Sample::I16(ffmpeg::format::sample::Type::Packed) => {
+            let bytes = frame.data(0);
+            // SAFETY: packed i16 — bytes is `samples * channels * 2` long.
+            #[allow(clippy::cast_ptr_alignment)]
+            let interleaved = unsafe {
+                std::slice::from_raw_parts(
+                    bytes.as_ptr().cast::<i16>(),
+                    samples * channels,
+                )
+            };
+            out.reserve(interleaved.len());
+            for &s in interleaved {
+                out.push(f32::from(s) * I16_TO_F32_SCALE);
+            }
+        }
+        Sample::I16(ffmpeg::format::sample::Type::Planar) => {
+            out.reserve(samples * channels);
+            let planes: Vec<&[i16]> = (0..channels)
+                .map(|c| {
+                    let bytes = frame.data(c);
+                    // SAFETY: planar i16 — bytes is `samples * 2` long.
+                    #[allow(clippy::cast_ptr_alignment)]
+                    unsafe {
+                        std::slice::from_raw_parts(bytes.as_ptr().cast::<i16>(), samples)
+                    }
+                })
+                .collect();
+            for s in 0..samples {
+                for plane in &planes {
+                    out.push(f32::from(plane[s]) * I16_TO_F32_SCALE);
+                }
+            }
+        }
+        _ => {
+            let fmt = frame.format();
+            tracing::warn!(?fmt, "unexpected Opus decoded format; skipping");
         }
     }
 }
