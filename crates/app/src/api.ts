@@ -7,6 +7,9 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 // --- Probe -----------------------------------------------------------
 
@@ -198,3 +201,34 @@ export const onClientState = (
 
 export const onAppLog = (cb: (line: LogLine) => void): Promise<UnlistenFn> =>
   listen<LogLine>("app:log", (ev) => cb(ev.payload));
+
+// --- Updater ---------------------------------------------------------
+// Re-export the plugin types verbatim so callers don't need to know
+// which package they live in. The state context (hosting.tsx) holds
+// the resolved Update object until either a re-check or an install.
+
+export type { Update } from "@tauri-apps/plugin-updater";
+
+/** Returns the running app's `Cargo.toml` / `tauri.conf.json` version. */
+export const appVersion = (): Promise<string> => getVersion();
+
+/**
+ * Probe the configured updater endpoint. Returns `null` when the
+ * running build is already at the latest version, or an `Update`
+ * object describing the available release.
+ *
+ * The plugin verifies the manifest signature against the public key
+ * embedded in `tauri.conf.json`'s `plugins.updater.pubkey` — a
+ * tampered or unsigned manifest yields a thrown error here.
+ */
+export const checkForUpdate = (): Promise<Update | null> => check();
+
+/**
+ * Download + install the queued update, then relaunch the app. The
+ * NSIS installer runs in `passive` mode (configured in
+ * tauri.conf.json) so the user sees a brief progress UI.
+ */
+export const installUpdateAndRelaunch = async (update: Update): Promise<void> => {
+  await update.downloadAndInstall();
+  await relaunch();
+};

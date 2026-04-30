@@ -7,10 +7,13 @@
     "core:default",
     "core:event:default",
     "core:path:default",
+    "core:app:default",
     "shell:allow-open",
     "core:window:allow-start-dragging",
     "core:window:allow-minimize",
     "core:window:allow-close",
-    "core:window:allow-toggle-maximize"
+    "core:window:allow-toggle-maximize",
+    "updater:default",
+    "process:default"
   ]
 }

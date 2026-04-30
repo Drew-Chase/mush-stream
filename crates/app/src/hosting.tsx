@@ -10,11 +10,14 @@ import {
 } from "react";
 
 import {
+  appVersion as fetchAppVersion,
+  checkForUpdate,
   clientStatus as fetchClientStatus,
   configLoadClient,
   configLoadHost,
   hostAddresses as fetchHostAddresses,
   hostStatus as fetchHostStatus,
+  installUpdateAndRelaunch,
   logsBuffer as fetchLogsBuffer,
   onAppLog,
   onClientState,
@@ -31,7 +34,9 @@ import {
   type RecentEntry,
   type ShareAddresses,
   type SystemProbe,
+  type Update,
 } from "./api";
+import { addToast } from "@heroui/react";
 
 const LOG_RING_SIZE = 1024;
 
@@ -47,6 +52,14 @@ interface AppStateShape {
   clientConfig: ClientConfig | null;
   recents: RecentEntry[];
   logs: LogLine[];
+  appVersion: string | null;
+  /** Set after a successful `checkForUpdate()` call when a newer version
+   *  is available. `null` means "no update queued" — could be either
+   *  "up to date" or "haven't checked yet"; use `updateChecked` to
+   *  distinguish. */
+  update: Update | null;
+  updateChecked: boolean;
+  updateInstalling: boolean;
 }
 
 interface AppStateApi extends AppStateShape {
@@ -64,6 +77,11 @@ interface AppStateApi extends AppStateShape {
    * that don't have a backend session yet. Most code should rely on the
    * `host:state` event flow instead. */
   setHosting: (v: boolean) => void;
+  /** Re-probe the configured update endpoint. */
+  refreshUpdate: () => Promise<void>;
+  /** Download + install the queued update, then relaunch. No-op when
+   *  no update is queued. */
+  installUpdate: () => Promise<void>;
 }
 
 const AppStateCtx = createContext<AppStateApi | null>(null);
@@ -81,6 +99,10 @@ export function HostingProvider({ children }: { children: ReactNode }) {
   const [recents, setRecents] = useState<RecentEntry[]>([]);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const logsRingRef = useRef<LogLine[]>([]);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [update, setUpdate] = useState<Update | null>(null);
+  const [updateChecked, setUpdateChecked] = useState(false);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
 
   const pushLog = useCallback((line: LogLine) => {
     const ring = logsRingRef.current;
@@ -129,6 +151,50 @@ export function HostingProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const refreshUpdate = useCallback(async () => {
+    try {
+      const next = await checkForUpdate();
+      setUpdate(next);
+      setUpdateChecked(true);
+      if (next) {
+        addToast({
+          title: `Update available — v${next.version}`,
+          description: "Open Settings → Updates to install.",
+          color: "primary",
+          timeout: 6000,
+        });
+      }
+    } catch (e) {
+      // Don't surface a toast on failure — most users hit this on
+      // first install before any release exists at the endpoint, or
+      // when offline. Logged for debugging.
+      console.error("update check failed", e);
+      setUpdateChecked(true);
+    }
+  }, []);
+
+  const installUpdate = useCallback(async () => {
+    if (!update) return;
+    setUpdateInstalling(true);
+    try {
+      await installUpdateAndRelaunch(update);
+      // installUpdateAndRelaunch calls relaunch() — process exits
+      // before we get here, so the next line is unreachable in
+      // practice. Defensive in case of failure between download
+      // and relaunch.
+      setUpdateInstalling(false);
+    } catch (e) {
+      console.error("update install failed", e);
+      addToast({
+        title: "Update failed",
+        description: String(e),
+        color: "danger",
+        timeout: 8000,
+      });
+      setUpdateInstalling(false);
+    }
+  }, [update]);
+
   // One-shot mount: probe + load configs + subscribe to events.
   useEffect(() => {
     let alive = true;
@@ -143,6 +209,12 @@ export function HostingProvider({ children }: { children: ReactNode }) {
         refreshRecents(),
         refreshHostConfig(),
         refreshClientConfig(),
+        fetchAppVersion()
+          .then((v) => {
+            if (alive) setAppVersion(v);
+          })
+          .catch((e) => console.error("appVersion failed", e)),
+        refreshUpdate(),
       ]);
       if (!alive) return;
 
@@ -226,6 +298,10 @@ export function HostingProvider({ children }: { children: ReactNode }) {
       clientConfig: clientCfg,
       recents,
       logs,
+      appVersion,
+      update,
+      updateChecked,
+      updateInstalling,
       hosting: hostState === "broadcasting",
       refreshSystem,
       refreshHostAddresses,
@@ -236,6 +312,8 @@ export function HostingProvider({ children }: { children: ReactNode }) {
       setHostConfig: setHostCfg,
       setClientConfig: setClientCfg,
       setHosting,
+      refreshUpdate,
+      installUpdate,
     }),
     [
       system,
@@ -249,12 +327,18 @@ export function HostingProvider({ children }: { children: ReactNode }) {
       clientCfg,
       recents,
       logs,
+      appVersion,
+      update,
+      updateChecked,
+      updateInstalling,
       refreshSystem,
       refreshHostAddresses,
       refreshRecents,
       refreshHostConfig,
       refreshClientConfig,
       setHosting,
+      refreshUpdate,
+      installUpdate,
     ],
   );
 

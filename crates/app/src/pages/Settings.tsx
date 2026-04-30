@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Card } from "../components/primitives";
+import { Btn, Card } from "../components/primitives";
 import { useHosting } from "../hosting";
 import {
   configSaveClient,
@@ -11,8 +11,18 @@ import {
 const DEBOUNCE_MS = 300;
 
 export default function Settings() {
-  const { hostConfig, clientConfig, setHostConfig, setClientConfig } =
-    useHosting();
+  const {
+    hostConfig,
+    clientConfig,
+    setHostConfig,
+    setClientConfig,
+    appVersion,
+    update,
+    updateChecked,
+    updateInstalling,
+    refreshUpdate,
+    installUpdate,
+  } = useHosting();
 
   const hostSaveTimer = useRef<number | null>(null);
   const clientSaveTimer = useRef<number | null>(null);
@@ -207,6 +217,62 @@ export default function Settings() {
               }}
             />
           </div>
+        </Card>
+        <Card>
+          <div className="cardhd">
+            <span className="cardhd__t">Updates</span>
+          </div>
+          <div className="setrow">
+            <div>
+              <div className="setrow__lbl">Current version</div>
+              <div className="setrow__sub">
+                {appVersion ? `v${appVersion}` : "loading…"}
+                {update
+                  ? ` — v${update.version} available`
+                  : updateChecked
+                    ? " — up to date"
+                    : appVersion
+                      ? " — checking for updates…"
+                      : ""}
+              </div>
+            </div>
+            {update ? (
+              <Btn
+                kind="live"
+                onClick={() => {
+                  void installUpdate();
+                }}
+                disabled={updateInstalling}
+              >
+                {updateInstalling ? "Installing…" : "Install update"}
+              </Btn>
+            ) : (
+              <Btn
+                onClick={() => {
+                  void refreshUpdate();
+                }}
+              >
+                Check now
+              </Btn>
+            )}
+          </div>
+          {update?.body ? (
+            <div className="setrow">
+              <div>
+                <div className="setrow__lbl">Release notes</div>
+                <div
+                  className="setrow__sub"
+                  style={{
+                    whiteSpace: "pre-wrap",
+                    fontFamily: "var(--mono)",
+                    fontSize: 11,
+                  }}
+                >
+                  {update.body}
+                </div>
+              </div>
+            </div>
+          ) : null}
         </Card>
       </div>
     </div>
