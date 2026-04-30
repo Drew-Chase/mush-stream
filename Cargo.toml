@@ -29,7 +29,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 png = "0.18.1"
 ffmpeg-the-third = "5.0.0+ffmpeg-8.1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "signal"] }
 # winit 0.30 defaults pull in wayland/x11; we're Windows-only. Pin rwh_05
 # explicitly so winit's `Window` exposes the raw-window-handle 0.5 traits
 # that pixels 0.14 still requires.
@@ -39,6 +39,13 @@ gilrs = "0.11.1"
 vigem-client = "0.1"
 reed-solomon-erasure = "6"
 clap = { version = "4", features = ["derive"] }
+# Used to lift the kernel UDP receive buffer cap so localhost or LAN
+# bursts (especially keyframe packets) don't drop on the floor before the
+# tokio receiver has a chance to drain them.
+socket2 = "0.6"
+# Public-domain 8x8 bitmap font used by the client's debug overlay so we
+# don't have to ship a TTF or pull in a full text-rasterization stack.
+font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
 
 # For automatic portforwarding
 upnpc-rs = { git = "https://github.com/Drew-Chase/upnpc-rs.git" }

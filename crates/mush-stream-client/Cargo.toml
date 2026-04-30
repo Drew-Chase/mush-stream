@@ -20,7 +20,8 @@ pixels = { workspace = true }
 gilrs = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 clap = { workspace = true }
-upnpc-rs = { workspace = true }
+socket2 = { workspace = true }
+font8x8 = { workspace = true }
 
 [lints]
 workspace = true

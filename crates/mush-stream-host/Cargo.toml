@@ -21,6 +21,7 @@ vigem-client = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 clap = { workspace = true }
 upnpc-rs = { workspace = true }
+socket2 = { workspace = true }
 
 [dev-dependencies]
 # tokio::test(start_paused) for deterministic timing tests in pacer.rs.
