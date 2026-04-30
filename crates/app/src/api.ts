@@ -43,6 +43,9 @@ export interface MonitorInfo {
   width: number;
   height: number;
   primary: boolean;
+  /** Active refresh rate in Hz (e.g. 60, 120, 144). Defaults to 60
+   *  when the OS lookup fails. */
+  refreshHz: number;
 }
 
 export interface MonitorScreenshot {
@@ -58,7 +61,7 @@ export const monitorScreenshot = (index: number) =>
 
 // --- Addresses -------------------------------------------------------
 
-export type AddressKind = "tailscale" | "lan";
+export type AddressKind = "lan" | "public";
 
 export interface LocalAddress {
   kind: AddressKind;
@@ -73,6 +76,23 @@ export interface ShareAddresses {
 }
 
 export const hostAddresses = () => invoke<ShareAddresses>("host_addresses");
+
+// --- Audio sessions --------------------------------------------------
+
+export interface AudioSessionInfo {
+  pid: number;
+  /** Leaf exe name (e.g. `chrome.exe`) or `"System"` for the
+   *  system-sounds session. Matches what goes into `host.toml`'s
+   *  `[audio].blacklist`. */
+  processName: string;
+  /** Friendly display name; empty for sessions that don't set one. */
+  displayName: string;
+  isSystem: boolean;
+  state: "Active" | "Inactive" | "Expired" | "Unknown";
+}
+
+export const audioSessionsList = () =>
+  invoke<AudioSessionInfo[]>("audio_sessions_list");
 
 // --- Recents ---------------------------------------------------------
 

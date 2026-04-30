@@ -34,6 +34,10 @@ local-ip-address = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 png = { workspace = true }
 base64 = "0.22"
+# Used by `addresses::fetch_public_ip` to query api.ipify.org.
+# rustls-tls keeps OpenSSL out of the build. Already in the dep
+# graph via tauri-plugin-updater so this is essentially free.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Extends the workspace `windows` features with the registry API used to
 # read the ViGEmBus driver version, plus the DXGI types we need to
 # enumerate adapters for the GPU label in the sidebar.

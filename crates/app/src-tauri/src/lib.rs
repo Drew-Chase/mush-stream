@@ -3,6 +3,7 @@
 //! the log-emitter task.
 
 mod addresses;
+mod audio_sessions;
 mod client_session;
 mod configs;
 mod host_session;
@@ -69,6 +70,7 @@ pub fn run() {
             monitors::monitors_list,
             monitors::monitor_screenshot,
             addresses::host_addresses,
+            audio_sessions::audio_sessions_list,
             recents::recents_list,
             recents::recents_add,
             recents::recents_clear,

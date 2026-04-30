@@ -29,6 +29,10 @@ pub struct MonitorInfo {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+    /// Active refresh rate in Hz (e.g. 60, 120, 144). The Host page
+    /// uses this to recommend an FPS that doesn't exceed the
+    /// display's refresh and to flag user-chosen fps values that do.
+    pub refresh_hz: u32,
 }
 
 /// `MonitorScreenshot` carries the actual image as a base64-encoded
@@ -88,7 +92,11 @@ fn blocking_list() -> anyhow::Result<Vec<MonitorInfo>> {
             let friendly = friendly_monitor_name(&device_name)
                 .unwrap_or_else(|| short_device_name(&device_name));
             let primary = bounds.left == 0 && bounds.top == 0;
-            let label = format!("{friendly} ({width}×{height})");
+            // Best-effort refresh rate. Most modern displays report
+            // 60 / 120 / 144 / 240; if the lookup fails we fall back
+            // to 60 so the UI still has a usable baseline.
+            let refresh_hz = refresh_rate_for_device(&device_name).unwrap_or(60);
+            let label = format!("{friendly} ({width}×{height} @ {refresh_hz}Hz)");
             monitors.push(MonitorInfo {
                 index: i,
                 name: label,
@@ -97,6 +105,7 @@ fn blocking_list() -> anyhow::Result<Vec<MonitorInfo>> {
                 width,
                 height,
                 primary,
+                refresh_hz,
             });
         }
     }
@@ -358,4 +367,48 @@ fn friendly_monitor_name(device_name: &str) -> Option<String> {
     } else {
         Some(name)
     }
+}
+
+/// Best-effort: read the active refresh rate (in Hz) for a DXGI
+/// device path via `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`.
+/// Returns `None` when the API can't resolve one — caller defaults
+/// to 60 in that case.
+#[cfg(windows)]
+fn refresh_rate_for_device(device_name: &str) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Graphics::Gdi::{
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+    };
+    use windows::core::PCWSTR;
+
+    let wide_device: Vec<u16> = std::ffi::OsStr::new(device_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut devmode = DEVMODEW {
+        dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: device_name is a fixed-length wide string buffer; the
+    // dmSize field is set to the struct size per the API contract.
+    let ok = unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR(wide_device.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &raw mut devmode,
+        )
+    };
+    if !ok.as_bool() {
+        return None;
+    }
+    let hz = devmode.dmDisplayFrequency;
+    // Some virtual displays report 0 or 1 (= "default"); treat
+    // those as "unknown" so the caller can fall through to its
+    // 60Hz baseline.
+    if hz <= 1 { None } else { Some(hz) }
+}
+
+#[cfg(not(windows))]
+fn refresh_rate_for_device(_device_name: &str) -> Option<u32> {
+    None
 }
