@@ -174,6 +174,20 @@ pub fn run_stream_blocking(
         tracing::info!("shutdown requested");
         shutdown.store(true, Ordering::Release);
 
+        // Drop the channel senders the OS worker threads block on
+        // *before* joining those threads. The vigem worker does a
+        // synchronous `rx.recv()` and only exits once its sender drops,
+        // and that sender (`gamepad_tx`) lives inside `inbound_handle`'s
+        // future. Joining vigem before this abort would deadlock — and
+        // since `host_stop` awaits this whole runtime, the frontend
+        // would freeze on "stopping" forever.
+        //
+        // Aborting alone is fire-and-forget; await the handle so the
+        // task is actually polled to completion and its captured
+        // sender is dropped before we hand off to spawn_blocking.
+        inbound_handle.abort();
+        let _ = inbound_handle.await;
+
         let _ = tokio::task::spawn_blocking(move || {
             let _ = encode_handle.join();
             let _ = vigem_handle.join();
@@ -182,8 +196,11 @@ pub fn run_stream_blocking(
             }
         })
         .await;
+        // Tear the socket down last so encoder-finish flush packets
+        // produced during `encode_handle.join()` actually go out the
+        // wire instead of bouncing off a closed datagram_rx.
         host_sock.abort();
-        inbound_handle.abort();
+        let _ = host_sock.await;
 
         anyhow::Ok(())
     })
